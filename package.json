@@ -1,0 +1,12 @@
+{
+  "name": "screencap-desktop",
+  "version": "0.1.0",
+  "description": "ScreenCap Desktop — scene-based screen/camera recorder (screen+system audio+mic, PiP compositing)",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.0.0"
+  }
+}
