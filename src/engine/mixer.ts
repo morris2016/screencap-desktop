@@ -6,7 +6,7 @@ export class Mixer {
   readonly ctx = new AudioContext();
   private dest = this.ctx.createMediaStreamDestination();
   private master = this.ctx.createDynamicsCompressor();
-  private strips = new Map<string, { gain: GainNode; analyser: AnalyserNode }>();
+  private strips = new Map<string, { gain: GainNode; analyser: AnalyserNode; monitor: GainNode }>();
 
   constructor() {
     // Limiter-ish curve: high threshold, hard ratio, fast attack.
@@ -26,10 +26,22 @@ export class Mixer {
     const gain = this.ctx.createGain();
     const analyser = this.ctx.createAnalyser();
     analyser.fftSize = 256;
+    // Live monitoring tap (muted by default): the mix bus feeds recordings/streams; this
+    // optional branch feeds the PC speakers so remote sources are audible in the room.
+    const monitor = this.ctx.createGain();
+    monitor.gain.value = 0;
     node.connect(gain);
     gain.connect(analyser);
     gain.connect(this.master);
-    this.strips.set(id, { gain, analyser });
+    gain.connect(monitor);
+    monitor.connect(this.ctx.destination);
+    this.strips.set(id, { gain, analyser, monitor });
+  }
+
+  /** Route this strip to the speakers (careful with local mics — feedback). */
+  setMonitor(id: string, on: boolean) {
+    const s = this.strips.get(id);
+    if (s) s.monitor.gain.value = on ? 1 : 0;
   }
 
   detach(id: string) {
@@ -37,6 +49,7 @@ export class Mixer {
     if (s) {
       s.gain.disconnect();
       s.analyser.disconnect();
+      s.monitor.disconnect();
       this.strips.delete(id);
     }
   }

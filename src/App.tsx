@@ -38,6 +38,7 @@ export function App() {
   const [phoneConnected, setPhoneConnected] = useState(false);
   const [library, setLibrary] = useState<LibItem[]>([]);
   const [muted, setMuted] = useState<Record<string, boolean>>({});
+  const [monitored, setMonitored] = useState<Record<string, boolean>>({});
   const streamer = useMemo(() => new Streamer(), []);
   const [streamUrl, setStreamUrl] = useState(localStorage.getItem('streamUrl') ?? 'rtmp://a.rtmp.youtube.com/live2');
   const [streamKey, setStreamKey] = useState(localStorage.getItem('streamKey') ?? '');
@@ -111,7 +112,14 @@ export function App() {
       const s = make();
       await s.start();
       compositor.registerSource(s);
-      if (s.audioNode) mixer.attach(s.id, s.audioNode);
+      if (s.audioNode) {
+        mixer.attach(s.id, s.audioNode);
+        if (s.kind === 'phone-cam') {
+          // Remote source: hearing it live is expected (no feedback risk from a far mic).
+          mixer.setMonitor(s.id, true);
+          setMonitored((m) => ({ ...m, [s.id]: true }));
+        }
+      }
       const next = [...sources, s];
       setSources(next);
       refreshScenes(next);
@@ -401,6 +409,17 @@ export function App() {
                 }}
               >
                 {muted[s.id] ? '🔇' : '🔊'}
+              </a>
+              <a
+                title="Monitor on PC speakers"
+                style={{ cursor: 'pointer', color: monitored[s.id] ? 'var(--accent2)' : 'var(--dim)', float: 'right', marginRight: 6 }}
+                onClick={() => {
+                  const m = !monitored[s.id];
+                  setMonitored({ ...monitored, [s.id]: m });
+                  mixer.setMonitor(s.id, m);
+                }}
+              >
+                🎧
               </a>
             </div>
             <input
