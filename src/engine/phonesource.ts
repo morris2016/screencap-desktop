@@ -22,6 +22,8 @@ export class PhoneSource implements Source {
   private nextAudioTime = 0;
   private statsCb: ((s: Record<string, unknown>) => void) | null = null;
   private decodedFrames = 0;
+  private sawKeyframe = false;
+  private receivedVideo = 0;
 
   constructor(private audioCtx: AudioContext, private port: number, private code: string) {
     this.id = `phone-${Date.now()}`;
@@ -68,13 +70,20 @@ export class PhoneSource implements Source {
         frame.close();
         this.decodedFrames++;
       },
-      error: () => {
+      error: (e) => {
+        console.error('[PhoneSource] decoder error:', e.message);
         // Decoder fault: rebuild on the next keyframe.
         this.decoder = null;
+        this.sawKeyframe = false;
       },
     });
     // No description => Annex-B mode; SPS/PPS arrive in-band before each keyframe.
-    this.decoder.configure({ codec: 'avc1.42E01F', optimizeForLatency: true });
+    try {
+      this.decoder.configure({ codec: 'avc1.42E01F', optimizeForLatency: true });
+    } catch (e) {
+      console.error('[PhoneSource] decoder configure failed:', (e as Error).message);
+      this.decoder = null;
+    }
   }
 
   private onFrame(buf: ArrayBuffer) {
@@ -88,6 +97,15 @@ export class PhoneSource implements Source {
     if (type === 1) {
       // VIDEO
       const key = (flags & 1) !== 0;
+      this.receivedVideo++;
+      if (this.receivedVideo === 1) console.log('[PhoneSource] first video frame, key =', key);
+      // A decoder must start on a keyframe — drop deltas until one arrives (the phone sends one
+      // every 2s wall-clock, so the picture appears within 2s of connecting).
+      if (!this.sawKeyframe) {
+        if (!key) return;
+        this.sawKeyframe = true;
+        console.log('[PhoneSource] first keyframe after', this.receivedVideo, 'frames');
+      }
       this.ensureDecoder();
       if (!this.decoder) return;
       if (this.decoder.decodeQueueSize > 8) return; // never let the queue snowball (latency)
@@ -99,8 +117,10 @@ export class PhoneSource implements Source {
             data: payload,
           }),
         );
-      } catch {
+      } catch (e) {
+        console.error('[PhoneSource] decode threw:', (e as Error).message);
         this.decoder = null;
+        this.sawKeyframe = false;
       }
     } else if (type === 2) {
       // AUDIO: PCM16 mono 48k → schedule.

@@ -16,6 +16,13 @@ function createWindow() {
     },
   });
   win.removeMenu();
+  // Renderer console → file, so field issues are diagnosable without DevTools.
+  const logPath = path.join(app.getPath('temp'), 'screencap-studio-console.log');
+  win.webContents.on('console-message', (e, level, message, line, sourceId) => {
+    try {
+      fs.appendFileSync(logPath, `[${new Date().toISOString()}] [${level}] ${message} (${sourceId}:${line})\n`);
+    } catch {}
+  });
   win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
 }
 

@@ -51,10 +51,11 @@ export function App() {
   // Hotkeys F1..F8 for scenes.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const idx = ['F1', 'F2', 'F3', 'F4', 'F5', 'F6', 'F7', 'F8'].indexOf(e.key);
-      if (idx >= 0 && scenes[idx]) {
+      // Match by the scene's DECLARED hotkey (labels and behavior must agree).
+      const sc = scenes.find((s) => s.hotkey === e.key);
+      if (sc) {
         e.preventDefault();
-        switchScene(scenes[idx].id);
+        switchScene(sc.id);
       }
     };
     window.addEventListener('keydown', onKey);
