@@ -46,9 +46,13 @@ export function App() {
 
   useEffect(() => {
     window.screencap.onLinkStatus((s) => setPhoneConnected(s.phone === 'connected'));
-    window.screencap.onStreamEnded((code) => {
+    window.screencap.onStreamEnded((code, reason) => {
       setLive(false);
-      setStatus(code === 0 ? 'stream ended' : `stream ended (ffmpeg exit ${code})`);
+      setStatus(
+        code === 0
+          ? 'stream ended'
+          : `stream ended — ${reason || `ffmpeg exit ${code}`}`,
+      );
     });
     void refreshLibrary();
   }, []);
@@ -70,6 +74,31 @@ export function App() {
     }, 200);
     return () => clearInterval(iv);
   }, [recorder]);
+
+  // Diagnostic: log the phone strip's post-gain peak every 2s (visible in the console log).
+  useEffect(() => {
+    const iv = setInterval(() => {
+      for (const s of sources) {
+        if (s.kind === 'phone-cam') {
+          console.log(`[Mixer] phone strip peak = ${mixer.peak(s.id).toFixed(3)}`);
+        }
+      }
+    }, 2000);
+    return () => clearInterval(iv);
+  }, [sources, mixer]);
+
+  function testTone() {
+    // Straight to the speakers — validates the output device + context independent of sources.
+    const osc = mixer.ctx.createOscillator();
+    const g = mixer.ctx.createGain();
+    g.gain.value = 0.2;
+    osc.frequency.value = 440;
+    osc.connect(g);
+    g.connect(mixer.ctx.destination);
+    osc.start();
+    osc.stop(mixer.ctx.currentTime + 0.5);
+    setStatus('test tone played (440Hz, 0.5s)');
+  }
 
   // Hotkeys F1..F8 for scenes.
   useEffect(() => {
@@ -346,6 +375,7 @@ export function App() {
               {recState === 'paused' ? 'Resume' : 'Pause'}
             </button>
             <button className="btn sec" onClick={screenshot}>📸</button>
+            <button className="btn sec" onClick={testTone}>♪</button>
             <button
               className="btn"
               style={{ background: live ? '#5c6270' : '#b71c1c', color: '#fff' }}

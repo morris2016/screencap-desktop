@@ -131,6 +131,12 @@ export class PhoneSource implements Source {
         if (this.audioCtx.state === 'suspended') void this.audioCtx.resume();
       }
       const samples = new Int16Array(payload.buffer, payload.byteOffset, len / 2);
+      // Amplitude probe: distinguishes "phone sends silence" from "audio graph broken".
+      if (this.receivedAudio % 100 === 0) {
+        let peak = 0;
+        for (let i = 0; i < samples.length; i++) peak = Math.max(peak, Math.abs(samples[i]));
+        console.log(`[PhoneSource] audio frame #${this.receivedAudio}, peak = ${peak}/32767`);
+      }
       const ab = this.audioCtx.createBuffer(1, samples.length, 48_000);
       const ch = ab.getChannelData(0);
       for (let i = 0; i < samples.length; i++) ch[i] = samples[i] / 32768;

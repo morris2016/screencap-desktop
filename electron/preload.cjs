@@ -15,5 +15,5 @@ contextBridge.exposeInMainWorld('screencap', {
   streamStart: (url, key, bitrateK) => ipcRenderer.invoke('stream-start', url, key, bitrateK),
   streamChunk: (chunk) => ipcRenderer.send('stream-chunk', chunk),
   streamStop: () => ipcRenderer.invoke('stream-stop'),
-  onStreamEnded: (cb) => ipcRenderer.on('stream-ended', (e, code) => cb(code)),
+  onStreamEnded: (cb) => ipcRenderer.on('stream-ended', (e, code, reason) => cb(code, reason)),
 });

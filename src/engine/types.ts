@@ -63,7 +63,7 @@ declare global {
       streamStart(url: string, key: string, bitrateK: number): Promise<{ ok: boolean; error?: string }>;
       streamChunk(chunk: ArrayBuffer): void;
       streamStop(): Promise<boolean>;
-      onStreamEnded(cb: (code: number) => void): void;
+      onStreamEnded(cb: (code: number, reason?: string) => void): void;
     };
   }
 }

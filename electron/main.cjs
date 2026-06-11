@@ -153,19 +153,32 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK) => {
     '-f', 'flv', target,
   ]);
   const logPath = path.join(app.getPath('temp'), 'screencap-studio-stream.log');
+  let recentErr = [];
   streamProc.stderr.on('data', (d) => {
-    try { fs.appendFileSync(logPath, d.toString()); } catch {}
+    const s = d.toString();
+    recentErr = recentErr.concat(s.split('\n').filter(Boolean)).slice(-8);
+    try { fs.appendFileSync(logPath, s); } catch {}
   });
+  // A dying pipe must NEVER take the app down: in-flight chunk writes race the process
+  // exit and surface as 'write EOF' on stdin (field crash). Swallow stream errors.
+  streamProc.stdin.on('error', () => {});
+  streamProc.on('error', () => {});
   streamProc.on('close', (code) => {
     streamProc = null;
+    const reason = recentErr
+      .filter((l) => /error|fail|refused|denied|not found|Invalid/i.test(l))
+      .slice(-2)
+      .join(' | ');
     for (const w of BrowserWindow.getAllWindows()) {
-      w.webContents.send('stream-ended', code ?? -1);
+      w.webContents.send('stream-ended', code ?? -1, reason);
     }
   });
   return { ok: true };
 });
 ipcMain.on('stream-chunk', (e, chunk) => {
-  if (streamProc?.stdin.writable) streamProc.stdin.write(Buffer.from(chunk));
+  try {
+    if (streamProc?.stdin.writable) streamProc.stdin.write(Buffer.from(chunk));
+  } catch {}
 });
 ipcMain.handle('stream-stop', () => {
   if (streamProc) {
