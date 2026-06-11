@@ -1,6 +1,9 @@
 const { app, BrowserWindow, ipcMain, dialog, desktopCapturer } = require('electron');
 const fs = require('fs');
 const path = require('path');
+const { LinkServer } = require('./linkserver.cjs');
+
+const link = new LinkServer();
 
 function createWindow() {
   const win = new BrowserWindow({
@@ -51,5 +54,16 @@ ipcMain.handle('save-screenshot', async (e, dataUrl) => {
   return filePath;
 });
 
-app.whenReady().then(createWindow);
-app.on('window-all-closed', () => app.quit());
+ipcMain.handle('link-start', () => link.start());
+ipcMain.handle('link-info', () => link.info());
+
+app.whenReady().then(() => {
+  createWindow();
+  link.onStatus = (s) => {
+    for (const w of BrowserWindow.getAllWindows()) w.webContents.send('link-status', s);
+  };
+});
+app.on('window-all-closed', () => {
+  link.stop();
+  app.quit();
+});

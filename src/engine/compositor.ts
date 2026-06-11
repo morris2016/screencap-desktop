@@ -84,7 +84,7 @@ export class Compositor {
     for (const item of items) {
       const src = this.sources.get(item.sourceId);
       const v = src?.video;
-      if (!v || !v.videoWidth) continue;
+      if (!v || !srcWidth(v)) continue;
       const x = item.x * canvas.width;
       const y = item.y * canvas.height;
       const w = item.w * canvas.width;
@@ -108,10 +108,18 @@ export class Compositor {
     ctx.globalAlpha = 1;
   }
 
-  private drawCover(v: HTMLVideoElement, x: number, y: number, w: number, h: number) {
-    const s = Math.max(w / v.videoWidth, h / v.videoHeight);
-    const dw = v.videoWidth * s;
-    const dh = v.videoHeight * s;
+  private drawCover(
+    v: HTMLVideoElement | HTMLCanvasElement,
+    x: number,
+    y: number,
+    w: number,
+    h: number,
+  ) {
+    const vw = srcWidth(v);
+    const vh = srcHeight(v);
+    const s = Math.max(w / vw, h / vh);
+    const dw = vw * s;
+    const dh = vh * s;
     const { ctx } = this;
     ctx.save();
     ctx.beginPath();
@@ -120,6 +128,13 @@ export class Compositor {
     ctx.drawImage(v, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
     ctx.restore();
   }
+}
+
+function srcWidth(v: HTMLVideoElement | HTMLCanvasElement): number {
+  return v instanceof HTMLVideoElement ? v.videoWidth : v.width;
+}
+function srcHeight(v: HTMLVideoElement | HTMLCanvasElement): number {
+  return v instanceof HTMLVideoElement ? v.videoHeight : v.height;
 }
 
 /** Built-in layout presets. */

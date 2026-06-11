@@ -12,10 +12,17 @@ export interface Source {
   readonly id: string;
   readonly kind: SourceKind;
   readonly label: string;
-  readonly video: HTMLVideoElement | null;
+  readonly video: HTMLVideoElement | HTMLCanvasElement | null;
   readonly audioNode: AudioNode | null;
   start(): Promise<void>;
   stop(): void;
+}
+
+export interface LinkInfo {
+  port: number;
+  code: string | null;
+  ips: string[];
+  phoneConnected: boolean;
 }
 
 /** One source placed in a scene, in canvas-normalized coordinates (0..1). */
@@ -43,6 +50,9 @@ declare global {
       getCaptureSources(): Promise<CaptureSourceInfo[]>;
       saveRecording(buf: ArrayBuffer, name: string): Promise<string | null>;
       saveScreenshot(dataUrl: string): Promise<string | null>;
+      linkStart(): Promise<LinkInfo>;
+      linkInfo(): Promise<LinkInfo>;
+      onLinkStatus(cb: (s: { phone: string }) => void): void;
     };
   }
 }

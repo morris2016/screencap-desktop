@@ -1,11 +1,13 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import QRCode from 'qrcode';
 import { Compositor, presetScenes } from './engine/compositor';
 import { Mixer } from './engine/mixer';
+import { PhoneSource } from './engine/phonesource';
 import { Recorder } from './engine/recorder';
 import { MicSource, ScreenSource, WebcamSource } from './engine/sources';
-import type { CaptureSourceInfo, Scene, SceneItem, Source } from './engine/types';
+import type { CaptureSourceInfo, LinkInfo, Scene, SceneItem, Source } from './engine/types';
 
-type Picker = 'none' | 'screen' | 'webcam' | 'mic';
+type Picker = 'none' | 'screen' | 'webcam' | 'mic' | 'phone';
 
 export function App() {
   const mixer = useMemo(() => new Mixer(), []);
@@ -24,6 +26,13 @@ export function App() {
   const [status, setStatus] = useState('Add a Screen or Camera source to begin');
   const [selection, setSelection] = useState<number>(-1); // index into active scene items
   const [, force] = useState(0);
+  const [linkInfo, setLinkInfo] = useState<LinkInfo | null>(null);
+  const [linkQr, setLinkQr] = useState<string>('');
+  const [phoneConnected, setPhoneConnected] = useState(false);
+
+  useEffect(() => {
+    window.screencap.onLinkStatus((s) => setPhoneConnected(s.phone === 'connected'));
+  }, []);
 
   // Mount the compositor canvas into the preview.
   useEffect(() => {
@@ -92,7 +101,12 @@ export function App() {
 
   async function openPicker(kind: Picker) {
     setPicker(kind);
-    if (kind === 'screen') {
+    if (kind === 'phone') {
+      const info = await window.screencap.linkStart();
+      setLinkInfo(info);
+      const payload = JSON.stringify({ host: info.ips[0], port: info.port, code: info.code });
+      setLinkQr(await QRCode.toDataURL(payload, { margin: 1, width: 240 }));
+    } else if (kind === 'screen') {
       setCaptureList(await window.screencap.getCaptureSources());
     } else if (kind === 'webcam' || kind === 'mic') {
       try {
@@ -207,7 +221,7 @@ export function App() {
           <button className="add" onClick={() => openPicker('screen')}>＋ Screen / Window</button>
           <button className="add" onClick={() => openPicker('webcam')}>＋ Camera</button>
           <button className="add" onClick={() => openPicker('mic')}>＋ Microphone</button>
-          <button className="add" disabled title="Phone Link — next milestone">＋ Phone (Link) — soon</button>
+          <button className="add" onClick={() => openPicker('phone')}>＋ Phone (Link)</button>
           {sources.map((s) => (
             <div className="card" key={s.id} onContextMenu={() => removeSource(s.id)}>
               {s.label}
@@ -312,6 +326,35 @@ export function App() {
                   ))}
                 </div>
                 <div className="hint">Displays include system audio; single windows are video-only (Windows limitation).</div>
+              </>
+            )}
+            {picker === 'phone' && linkInfo && (
+              <>
+                <h3>Link your phone</h3>
+                <div style={{ display: 'flex', gap: 18, alignItems: 'flex-start' }}>
+                  {linkQr && <img src={linkQr} style={{ borderRadius: 8, background: '#fff' }} />}
+                  <div>
+                    <p>In ScreenCap on your phone, open <b>Desktop Link</b> and enter:</p>
+                    <p style={{ margin: '10px 0', fontSize: 16 }}>
+                      Host: <b>{linkInfo.ips.join(' or ')}</b><br />
+                      Port: <b>{linkInfo.port}</b><br />
+                      Code: <b style={{ letterSpacing: 2 }}>{linkInfo.code}</b>
+                    </p>
+                    <p style={{ color: phoneConnected ? '#43a047' : 'var(--dim)' }}>
+                      {phoneConnected ? '✓ Phone connected' : 'Waiting for the phone… (both devices must be on the same Wi-Fi)'}
+                    </p>
+                    {phoneConnected && (
+                      <button
+                        className="btn rec" style={{ marginTop: 10 }}
+                        onClick={() =>
+                          addSource(() => new PhoneSource(mixer.ctx, linkInfo.port, linkInfo.code ?? ''))
+                        }
+                      >
+                        Add phone camera to sources
+                      </button>
+                    )}
+                  </div>
+                </div>
               </>
             )}
             {(picker === 'webcam' || picker === 'mic') && (
