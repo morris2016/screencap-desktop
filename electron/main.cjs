@@ -135,54 +135,153 @@ ipcMain.handle('library-delete', (e, p) => {
   return true;
 });
 
-// ---- Desktop Go-LIVE: renderer ships timesliced capture chunks; ffmpeg transcodes to a
-// conformant RTMP stream (libx264, 2s keyframes BY CONSTRUCTION, AAC). ----
-let streamProc = null;
-ipcMain.handle('stream-start', (e, url, key, bitrateK) => {
-  const ff = ffmpegPath();
-  if (!ff) return { ok: false, error: 'ffmpeg not found' };
-  if (streamProc) return { ok: false, error: 'already streaming' };
+// ---- Desktop Go-LIVE: supervised ffmpeg with auto-restart, live health, and a watchdog.
+// NO -re: live pipes are already real-time; -re double-throttled reads to 1.6fps and
+// collapsed all nine field attempts ("Conversion failed!"). ----
+const stream = {
+  proc: null,
+  wanted: false,        // user intent: stay live until they stop
+  target: null,
+  bitrateK: 4000,
+  attempts: 0,
+  lastOkMs: 0,
+  lastProgressMs: 0,
+  lastSpeed: 1,
+  slowSinceMs: 0,
+  restartTimer: null,
+  watchdog: null,
+};
+
+function sendAll(channel, ...args) {
+  for (const w of BrowserWindow.getAllWindows()) w.webContents.send(channel, ...args);
+}
+
+function spawnStream() {
   const { spawn } = require('child_process');
-  const target = `${url.replace(/\/$/, '')}/${key}`;
-  streamProc = spawn(ff, [
-    '-re', '-i', 'pipe:0',
-    '-c:v', 'libx264', '-preset', 'veryfast', '-tune', 'zerolatency',
-    '-b:v', `${bitrateK}k`, '-maxrate', `${bitrateK}k`, '-bufsize', `${bitrateK * 2}k`,
-    '-g', '60', '-keyint_min', '60', '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-b:a', '160k', '-ar', '44100',
-    '-f', 'flv', target,
-  ]);
+  const ff = ffmpegPath();
   const logPath = path.join(app.getPath('temp'), 'screencap-studio-stream.log');
   let recentErr = [];
-  streamProc.stderr.on('data', (d) => {
+  const p = spawn(ff, [
+    '-fflags', 'nobuffer', '-i', 'pipe:0',
+    '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency',
+    '-b:v', `${stream.bitrateK}k`, '-maxrate', `${stream.bitrateK}k`,
+    '-bufsize', `${stream.bitrateK * 2}k`,
+    '-g', '60', '-keyint_min', '60', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '160k', '-ar', '44100',
+    '-f', 'flv', stream.target,
+  ]);
+  stream.proc = p;
+  stream.lastProgressMs = Date.now();
+  p.stdin.on('error', () => {});
+  p.on('error', () => {});
+  p.stderr.on('data', (d) => {
     const s = d.toString();
     recentErr = recentErr.concat(s.split('\n').filter(Boolean)).slice(-8);
     try { fs.appendFileSync(logPath, s); } catch {}
-  });
-  // A dying pipe must NEVER take the app down: in-flight chunk writes race the process
-  // exit and surface as 'write EOF' on stdin (field crash). Swallow stream errors.
-  streamProc.stdin.on('error', () => {});
-  streamProc.on('error', () => {});
-  streamProc.on('close', (code) => {
-    streamProc = null;
-    const reason = recentErr
-      .filter((l) => /error|fail|refused|denied|not found|Invalid/i.test(l))
-      .slice(-2)
-      .join(' | ');
-    for (const w of BrowserWindow.getAllWindows()) {
-      w.webContents.send('stream-ended', code ?? -1, reason);
+    // Health: "frame= 123 fps= 30 ... bitrate=4012.3kbits/s ... speed=1.01x"
+    const m = s.match(/frame=\s*(\d+).*?fps=\s*([\d.]+).*?bitrate=\s*([\d.]+)kbits\/s.*?speed=\s*([\d.]+)x/s);
+    if (m) {
+      stream.lastProgressMs = Date.now();
+      stream.lastSpeed = parseFloat(m[4]);
+      sendAll('stream-health', {
+        fps: parseFloat(m[2]),
+        kbps: Math.round(parseFloat(m[3])),
+        speed: stream.lastSpeed,
+        attempts: stream.attempts,
+      });
+      // 30s of healthy streaming resets the restart budget (stable-streak rule).
+      if (stream.lastSpeed >= 0.95) {
+        if (!stream.lastOkMs) stream.lastOkMs = Date.now();
+        if (Date.now() - stream.lastOkMs > 30_000) stream.attempts = 0;
+      } else {
+        stream.lastOkMs = 0;
+      }
     }
   });
+  p.on('close', (code) => {
+    if (stream.proc !== p) return;
+    stream.proc = null;
+    const reason = recentErr
+      .filter((l) => /error|fail|refused|denied|not found|Invalid|I\/O/i.test(l))
+      .slice(-2).join(' | ');
+    if (stream.wanted) {
+      scheduleRestart(reason || `exit ${code}`);
+    } else {
+      sendAll('stream-ended', code ?? 0, reason);
+    }
+  });
+}
+
+function scheduleRestart(reason) {
+  stream.attempts++;
+  const delays = [1_000, 2_000, 4_000, 8_000, 15_000];
+  if (stream.attempts > delays.length) {
+    stream.wanted = false;
+    stopWatchdog();
+    sendAll('stream-ended', -1, `gave up after ${delays.length} restarts (${reason})`);
+    return;
+  }
+  const delay = delays[stream.attempts - 1];
+  sendAll('stream-restarting', stream.attempts, reason, delay);
+  stream.restartTimer = setTimeout(() => {
+    if (!stream.wanted) return;
+    spawnStream();
+    sendAll('stream-resume'); // renderer restarts MediaRecorder => fresh container header
+  }, delay);
+}
+
+function startWatchdog() {
+  stopWatchdog();
+  stream.watchdog = setInterval(() => {
+    if (!stream.wanted || !stream.proc) return;
+    const stalled = Date.now() - stream.lastProgressMs > 5_000;
+    if (stream.lastSpeed < 0.9) {
+      if (!stream.slowSinceMs) stream.slowSinceMs = Date.now();
+    } else {
+      stream.slowSinceMs = 0;
+    }
+    const tooSlow = stream.slowSinceMs && Date.now() - stream.slowSinceMs > 10_000;
+    if (stalled || tooSlow) {
+      try { stream.proc.kill(); } catch {}
+      // close handler schedules the supervised restart
+      stream.lastProgressMs = Date.now();
+      stream.slowSinceMs = 0;
+    }
+  }, 2_000);
+}
+
+function stopWatchdog() {
+  if (stream.watchdog) clearInterval(stream.watchdog);
+  stream.watchdog = null;
+  if (stream.restartTimer) clearTimeout(stream.restartTimer);
+  stream.restartTimer = null;
+}
+
+ipcMain.handle('stream-start', (e, url, key, bitrateK) => {
+  const ff = ffmpegPath();
+  if (!ff) return { ok: false, error: 'ffmpeg not found — install it or set FFMPEG env var' };
+  if (!/^rtmps?:\/\/.+/.test(url)) return { ok: false, error: 'URL must start with rtmp:// or rtmps://' };
+  if (!key.trim()) return { ok: false, error: 'stream key is empty' };
+  if (stream.proc) return { ok: false, error: 'already streaming' };
+  stream.target = `${url.replace(/\/$/, '')}/${key.trim()}`;
+  stream.bitrateK = bitrateK;
+  stream.wanted = true;
+  stream.attempts = 0;
+  stream.lastOkMs = 0;
+  spawnStream();
+  startWatchdog();
   return { ok: true };
 });
 ipcMain.on('stream-chunk', (e, chunk) => {
   try {
-    if (streamProc?.stdin.writable) streamProc.stdin.write(Buffer.from(chunk));
+    if (stream.proc?.stdin.writable) stream.proc.stdin.write(Buffer.from(chunk));
   } catch {}
 });
 ipcMain.handle('stream-stop', () => {
-  if (streamProc) {
-    try { streamProc.stdin.end(); } catch {}
+  stream.wanted = false;
+  stopWatchdog();
+  if (stream.proc) {
+    try { stream.proc.stdin.end(); } catch {}
   }
   return true;
 });

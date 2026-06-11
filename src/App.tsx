@@ -48,12 +48,23 @@ export function App() {
     window.screencap.onLinkStatus((s) => setPhoneConnected(s.phone === 'connected'));
     window.screencap.onStreamEnded((code, reason) => {
       setLive(false);
+      streamer.stop();
       setStatus(
         code === 0
           ? 'stream ended'
           : `stream ended — ${reason || `ffmpeg exit ${code}`}`,
       );
     });
+    window.screencap.onStreamHealth((h) => {
+      setStatus(
+        `🔴 LIVE · ${h.kbps} kbps · ${h.fps.toFixed(0)} fps · speed ${h.speed.toFixed(2)}x` +
+          (h.attempts > 0 ? ` · ${h.attempts} restarts` : ''),
+      );
+    });
+    window.screencap.onStreamRestarting((n, reason, delay) => {
+      setStatus(`⚠ stream restarting (#${n} in ${delay / 1000}s) — ${reason}`);
+    });
+    window.screencap.onStreamResume(() => streamer.restartCapture());
     void refreshLibrary();
   }, []);
 
@@ -201,26 +212,28 @@ export function App() {
     setRecState('recording');
   }
 
-  async function toggleLive() {
+  async function goLive(url: string, key: string) {
     if (live) {
       streamer.stop();
       setLive(false);
+      setStatus('stream stopped');
       return;
     }
-    if (!streamKey) {
+    if (!key) {
       setStatus('enter your stream key first');
       return;
     }
     setStatus('starting stream…');
-    const err = await streamer.start(
-      compositor.captureStream(30), mixer.stream, streamUrl, streamKey, 4000,
-    );
+    const err = await streamer.start(compositor.captureStream(30), mixer.stream, url, key, 4000);
     if (err) setStatus(`stream failed: ${err}`);
     else {
       setLive(true);
-      setStatus('🔴 LIVE');
+      setStatus('🔴 connecting…');
     }
   }
+
+  const toggleLive = () => goLive(streamUrl, streamKey);
+  const testLocal = () => goLive('rtmp://127.0.0.1:19350/live', 'test');
 
   async function screenshot() {
     const saved = await window.screencap.saveScreenshot(compositor.screenshot());
@@ -334,6 +347,7 @@ export function App() {
             value={streamKey}
             onChange={(e) => { setStreamKey(e.target.value); localStorage.setItem('streamKey', e.target.value); }}
           />
+          <button className="add" onClick={testLocal}>🧪 Test stream (local harness)</button>
         </div>
 
         <div className="preview-wrap">

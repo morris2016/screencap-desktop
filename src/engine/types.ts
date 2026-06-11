@@ -64,6 +64,9 @@ declare global {
       streamChunk(chunk: ArrayBuffer): void;
       streamStop(): Promise<boolean>;
       onStreamEnded(cb: (code: number, reason?: string) => void): void;
+      onStreamHealth(cb: (h: { fps: number; kbps: number; speed: number; attempts: number }) => void): void;
+      onStreamRestarting(cb: (attempt: number, reason: string, delayMs: number) => void): void;
+      onStreamResume(cb: () => void): void;
     };
   }
 }

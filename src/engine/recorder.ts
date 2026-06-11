@@ -71,31 +71,49 @@ export class Recorder {
   }
 }
 
-/** Desktop Go-LIVE: timesliced capture piped to the main process's ffmpeg → RTMP. */
+/** Desktop Go-LIVE: timesliced capture piped to the main process's supervised ffmpeg → RTMP. */
 export class Streamer {
   private recorder: MediaRecorder | null = null;
+  private out: MediaStream | null = null;
   live = false;
 
   async start(video: MediaStream, audio: MediaStream, url: string, key: string, bitrateK: number): Promise<string | null> {
     const res = await window.screencap.streamStart(url, key, bitrateK);
     if (!res.ok) return res.error ?? 'failed';
-    const out = new MediaStream([...video.getVideoTracks(), ...audio.getAudioTracks()]);
-    const mime = MediaRecorder.isTypeSupported('video/x-matroska;codecs=avc1,opus')
-      ? 'video/x-matroska;codecs=avc1,opus'
-      : 'video/webm;codecs=vp9,opus';
-    this.recorder = new MediaRecorder(out, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
-    this.recorder.ondataavailable = async (e) => {
-      if (e.data.size) window.screencap.streamChunk(await e.data.arrayBuffer());
-    };
-    this.recorder.start(250); // 4 chunks/s into the ffmpeg pipe
+    this.out = new MediaStream([...video.getVideoTracks(), ...audio.getAudioTracks()]);
+    this.beginCapture();
     this.live = true;
     return null;
   }
 
+  /** (Re)start the MediaRecorder — each supervised ffmpeg restart needs a fresh container. */
+  restartCapture() {
+    if (!this.live || !this.out) return;
+    try {
+      this.recorder?.stop();
+    } catch {}
+    this.beginCapture();
+  }
+
+  private beginCapture() {
+    if (!this.out) return;
+    const mime = MediaRecorder.isTypeSupported('video/x-matroska;codecs=avc1,opus')
+      ? 'video/x-matroska;codecs=avc1,opus'
+      : 'video/webm;codecs=vp9,opus';
+    this.recorder = new MediaRecorder(this.out, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+    this.recorder.ondataavailable = async (e) => {
+      if (e.data.size) window.screencap.streamChunk(await e.data.arrayBuffer());
+    };
+    this.recorder.start(250); // 4 chunks/s into the ffmpeg pipe
+  }
+
   stop() {
     this.live = false;
-    this.recorder?.stop();
+    try {
+      this.recorder?.stop();
+    } catch {}
     this.recorder = null;
+    this.out = null;
     void window.screencap.streamStop();
   }
 }
