@@ -29,9 +29,21 @@ class LinkServer {
     return out;
   }
 
-  start() {
+  start(persistDir) {
     if (this.wss) return this.info();
-    this.code = crypto.randomBytes(3).toString('hex').toUpperCase(); // e.g. A1B2C3
+    // Persist the pairing code across Studio restarts — re-typing it on the phone every run
+    // was real friction (field feedback).
+    const fs = require('fs');
+    const path = require('path');
+    const codeFile = persistDir ? path.join(persistDir, 'link-code.txt') : null;
+    if (codeFile && fs.existsSync(codeFile)) {
+      this.code = fs.readFileSync(codeFile, 'utf8').trim();
+    } else {
+      this.code = crypto.randomBytes(3).toString('hex').toUpperCase(); // e.g. A1B2C3
+      if (codeFile) {
+        try { fs.writeFileSync(codeFile, this.code); } catch {}
+      }
+    }
     this.wss = new WebSocketServer({ port: this.port });
     this.wss.on('connection', (sock, req) => {
       const url = new URL(req.url, 'ws://x');

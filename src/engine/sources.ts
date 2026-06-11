@@ -15,6 +15,7 @@ abstract class BaseSource implements Source {
   readonly id: string;
   video: HTMLVideoElement | null = null;
   audioNode: AudioNode | null = null;
+  rotation = 0;
   protected stream: MediaStream | null = null;
   constructor(
     readonly kind: SourceKind,

@@ -95,7 +95,7 @@ export class Compositor {
         ctx.roundRect(x, y, w, h, 18);
         ctx.clip();
       }
-      this.drawCover(v, x, y, w, h);
+      this.drawCover(v, x, y, w, h, src!.rotation ?? 0);
       ctx.restore();
       if (item.accent) {
         ctx.strokeStyle = '#e53935';
@@ -114,18 +114,23 @@ export class Compositor {
     y: number,
     w: number,
     h: number,
+    rotation = 0,
   ) {
-    const vw = srcWidth(v);
-    const vh = srcHeight(v);
+    const rot = ((rotation % 360) + 360) % 360;
+    const swapped = rot === 90 || rot === 270;
+    const vw = swapped ? srcHeight(v) : srcWidth(v);
+    const vh = swapped ? srcWidth(v) : srcHeight(v);
     const s = Math.max(w / vw, h / vh);
-    const dw = vw * s;
-    const dh = vh * s;
     const { ctx } = this;
     ctx.save();
     ctx.beginPath();
     ctx.rect(x, y, w, h);
     ctx.clip();
-    ctx.drawImage(v, x + (w - dw) / 2, y + (h - dh) / 2, dw, dh);
+    ctx.translate(x + w / 2, y + h / 2);
+    ctx.rotate((rot * Math.PI) / 180);
+    const dw = srcWidth(v) * s;
+    const dh = srcHeight(v) * s;
+    ctx.drawImage(v, -dw / 2, -dh / 2, dw, dh);
     ctx.restore();
   }
 }

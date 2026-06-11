@@ -14,6 +14,7 @@ export class PhoneSource implements Source {
   label = 'Phone camera';
   video: HTMLCanvasElement | null = null;
   audioNode: AudioNode | null = null;
+  rotation = 0;
 
   private ws: WebSocket | null = null;
   private decoder: VideoDecoder | null = null;
@@ -24,6 +25,7 @@ export class PhoneSource implements Source {
   private decodedFrames = 0;
   private sawKeyframe = false;
   private receivedVideo = 0;
+  private receivedAudio = 0;
 
   constructor(private audioCtx: AudioContext, private port: number, private code: string) {
     this.id = `phone-${Date.now()}`;
@@ -124,6 +126,10 @@ export class PhoneSource implements Source {
       }
     } else if (type === 2) {
       // AUDIO: PCM16 mono 48k → schedule.
+      if (this.receivedAudio++ === 0) {
+        console.log('[PhoneSource] first audio frame, ctx state =', this.audioCtx.state);
+        if (this.audioCtx.state === 'suspended') void this.audioCtx.resume();
+      }
       const samples = new Int16Array(payload.buffer, payload.byteOffset, len / 2);
       const ab = this.audioCtx.createBuffer(1, samples.length, 48_000);
       const ch = ab.getChannelData(0);

@@ -3,9 +3,16 @@ import QRCode from 'qrcode';
 import { Compositor, presetScenes } from './engine/compositor';
 import { Mixer } from './engine/mixer';
 import { PhoneSource } from './engine/phonesource';
-import { Recorder } from './engine/recorder';
+import { Recorder, Streamer } from './engine/recorder';
 import { MicSource, ScreenSource, WebcamSource } from './engine/sources';
 import type { CaptureSourceInfo, LinkInfo, Scene, SceneItem, Source } from './engine/types';
+
+interface LibItem {
+  name: string;
+  path: string;
+  size: number;
+  mtime: number;
+}
 
 type Picker = 'none' | 'screen' | 'webcam' | 'mic' | 'phone';
 
@@ -29,10 +36,25 @@ export function App() {
   const [linkInfo, setLinkInfo] = useState<LinkInfo | null>(null);
   const [linkQr, setLinkQr] = useState<string>('');
   const [phoneConnected, setPhoneConnected] = useState(false);
+  const [library, setLibrary] = useState<LibItem[]>([]);
+  const [muted, setMuted] = useState<Record<string, boolean>>({});
+  const streamer = useMemo(() => new Streamer(), []);
+  const [streamUrl, setStreamUrl] = useState(localStorage.getItem('streamUrl') ?? 'rtmp://a.rtmp.youtube.com/live2');
+  const [streamKey, setStreamKey] = useState(localStorage.getItem('streamKey') ?? '');
+  const [live, setLive] = useState(false);
 
   useEffect(() => {
     window.screencap.onLinkStatus((s) => setPhoneConnected(s.phone === 'connected'));
+    window.screencap.onStreamEnded((code) => {
+      setLive(false);
+      setStatus(code === 0 ? 'stream ended' : `stream ended (ffmpeg exit ${code})`);
+    });
+    void refreshLibrary();
   }, []);
+
+  async function refreshLibrary() {
+    setLibrary(await window.screencap.libraryList());
+  }
 
   // Mount the compositor canvas into the preview.
   useEffect(() => {
@@ -135,10 +157,32 @@ export function App() {
       setRecState('inactive');
       return;
     }
-    recorder.start(compositor.captureStream(30), mixer.stream, (saved) =>
-      setStatus(saved ? `saved → ${saved}` : 'save canceled'),
-    );
+    recorder.start(compositor.captureStream(30), mixer.stream, (saved) => {
+      setStatus(saved ? `saved → ${saved}` : 'save failed');
+      void refreshLibrary();
+    });
     setRecState('recording');
+  }
+
+  async function toggleLive() {
+    if (live) {
+      streamer.stop();
+      setLive(false);
+      return;
+    }
+    if (!streamKey) {
+      setStatus('enter your stream key first');
+      return;
+    }
+    setStatus('starting stream…');
+    const err = await streamer.start(
+      compositor.captureStream(30), mixer.stream, streamUrl, streamKey, 4000,
+    );
+    if (err) setStatus(`stream failed: ${err}`);
+    else {
+      setLive(true);
+      setStatus('🔴 LIVE');
+    }
   }
 
   async function screenshot() {
@@ -227,8 +271,32 @@ export function App() {
             <div className="card" key={s.id} onContextMenu={() => removeSource(s.id)}>
               {s.label}
               <small>{s.kind} · right-click to remove</small>
+              {s.kind === 'phone-cam' && (
+                <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
+                  <button
+                    className="add" style={{ marginBottom: 0 }}
+                    onClick={(e) => { e.stopPropagation(); s.rotation = (s.rotation + 90) % 360; force((x) => x + 1); }}
+                  >↻ {s.rotation}°</button>
+                  <button
+                    className="add" style={{ marginBottom: 0 }}
+                    onClick={(e) => { e.stopPropagation(); (s as PhoneSource).sendControl({ cmd: 'switch-camera' }); }}
+                  >🔄 lens</button>
+                </div>
+              )}
             </div>
           ))}
+
+          <h2 style={{ marginTop: 14 }}>Go Live</h2>
+          <input
+            className="add" style={{ textAlign: 'left' }} placeholder="RTMP URL"
+            value={streamUrl}
+            onChange={(e) => { setStreamUrl(e.target.value); localStorage.setItem('streamUrl', e.target.value); }}
+          />
+          <input
+            className="add" style={{ textAlign: 'left' }} placeholder="Stream key" type="password"
+            value={streamKey}
+            onChange={(e) => { setStreamKey(e.target.value); localStorage.setItem('streamKey', e.target.value); }}
+          />
         </div>
 
         <div className="preview-wrap">
@@ -270,7 +338,14 @@ export function App() {
               {recState === 'paused' ? 'Resume' : 'Pause'}
             </button>
             <button className="btn sec" onClick={screenshot}>📸</button>
-            <span className={`timer ${recState !== 'inactive' ? 'live' : ''}`}>{fmt(elapsed)}</span>
+            <button
+              className="btn"
+              style={{ background: live ? '#5c6270' : '#b71c1c', color: '#fff' }}
+              onClick={toggleLive}
+            >
+              {live ? '⏹ End stream' : '🔴 Go LIVE'}
+            </button>
+            <span className={`timer ${recState !== 'inactive' || live ? 'live' : ''}`}>{fmt(elapsed)}</span>
           </div>
         </div>
 
@@ -288,15 +363,49 @@ export function App() {
             </div>
           ))}
           {scenes.length === 0 && <small style={{ color: 'var(--dim)' }}>Scenes appear when sources exist.</small>}
+
+          <h2 style={{ marginTop: 14 }}>
+            Library{' '}
+            <a style={{ cursor: 'pointer', color: 'var(--accent2)' }} onClick={() => void window.screencap.libraryOpenFolder()}>
+              open folder
+            </a>
+          </h2>
+          {library.map((f) => (
+            <div className="card" key={f.path}>
+              <span style={{ fontSize: 12 }}>{f.name}</span>
+              <small>{(f.size / 1048576).toFixed(1)} MB</small>
+              <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                <button className="add" style={{ marginBottom: 0 }} onClick={() => void window.screencap.libraryOpen(f.path)}>▶ Play</button>
+                <button
+                  className="add" style={{ marginBottom: 0 }}
+                  onClick={async () => { await window.screencap.libraryDelete(f.path); void refreshLibrary(); }}
+                >🗑</button>
+              </div>
+            </div>
+          ))}
+          {library.length === 0 && <small style={{ color: 'var(--dim)' }}>Recordings land here.</small>}
         </div>
       </div>
 
       <div className="mixer">
         {sources.filter((s) => s.audioNode).map((s) => (
           <div className="strip" key={s.id}>
-            <div className="name">{s.label}</div>
+            <div className="name">
+              {s.label}{' '}
+              <a
+                style={{ cursor: 'pointer', color: muted[s.id] ? 'var(--accent)' : 'var(--dim)', float: 'right' }}
+                onClick={() => {
+                  const m = !muted[s.id];
+                  setMuted({ ...muted, [s.id]: m });
+                  mixer.setGain(s.id, m ? 0 : 1);
+                }}
+              >
+                {muted[s.id] ? '🔇' : '🔊'}
+              </a>
+            </div>
             <input
               type="range" min="0" max="1.5" step="0.01" defaultValue="1"
+              disabled={muted[s.id]}
               onChange={(e) => mixer.setGain(s.id, Number(e.target.value))}
             />
             <div className="meter"><i style={{ width: `${Math.min(100, mixer.peak(s.id) * 140)}%` }} /></div>

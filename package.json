@@ -1,12 +1,21 @@
 {
   "name": "screencap-desktop",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "ScreenCap Studio — scene-based recording/streaming studio with first-party Phone Link",
   "main": "electron/main.cjs",
   "scripts": {
     "build": "vite build",
     "start": "vite build && electron .",
-    "electron": "electron ."
+    "electron": "electron .",
+    "dist": "vite build && electron-builder --win nsis"
+  },
+  "build": {
+    "appId": "com.screencap.studio",
+    "productName": "ScreenCap Studio",
+    "directories": { "output": "release" },
+    "files": ["dist/**", "electron/**", "package.json"],
+    "win": { "target": "nsis" },
+    "nsis": { "oneClick": true, "deleteAppDataOnUninstall": false }
   },
   "devDependencies": {
     "@types/qrcode": "^1.5.6",
@@ -14,6 +23,7 @@
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.0",
     "electron": "^33.0.0",
+    "electron-builder": "^25.1.8",
     "typescript": "^5.6.0",
     "vite": "^5.4.0"
   },
