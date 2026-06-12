@@ -169,6 +169,13 @@ export function App() {
             const [lo, mud, pres, air] = presetBands(parsed.preset);
             initial = { ...initial, eqLow: lo, eqMud: mud, eqPresence: pres, eqAir: air };
           }
+          if (initial && !localStorage.getItem('voicefx-aec-migrated')) {
+            // One-time: settings saved before the AEC-chops-speech finding carried
+            // echoCancel=true forward — force the safe default once; re-enabling sticks.
+            initial = { ...initial, echoCancel: false };
+            localStorage.setItem(`voicefx:${s.label}`, JSON.stringify(initial));
+            localStorage.setItem('voicefx-aec-migrated', '1');
+          }
           const chain = new VoiceChain(mixer.ctx, initial);
           await chain.init();
           s.audioNode.connect(chain.input);
