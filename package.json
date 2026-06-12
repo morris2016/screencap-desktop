@@ -12,10 +12,21 @@
   "build": {
     "appId": "com.screencap.studio",
     "productName": "ScreenCap Studio",
-    "directories": { "output": "release" },
-    "files": ["dist/**", "electron/**", "package.json"],
-    "win": { "target": "nsis" },
-    "nsis": { "oneClick": true, "deleteAppDataOnUninstall": false }
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": true,
+      "deleteAppDataOnUninstall": false
+    }
   },
   "devDependencies": {
     "@types/qrcode": "^1.5.6",
@@ -28,6 +39,7 @@
     "vite": "^5.4.0"
   },
   "dependencies": {
+    "@sapphi-red/web-noise-suppressor": "^0.3.5",
     "qrcode": "^1.5.4",
     "react": "^18.3.0",
     "react-dom": "^18.3.0",

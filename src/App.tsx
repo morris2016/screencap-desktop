@@ -5,6 +5,7 @@ import { Mixer } from './engine/mixer';
 import { PhoneSource } from './engine/phonesource';
 import { Recorder, Streamer } from './engine/recorder';
 import { MicSource, ScreenSource, WebcamSource } from './engine/sources';
+import { DEFAULT_FX, VoiceChain, type VoiceFx } from './engine/voicechain';
 import type { CaptureSourceInfo, LinkInfo, Scene, SceneItem, Source } from './engine/types';
 
 interface LibItem {
@@ -39,6 +40,9 @@ export function App() {
   const [library, setLibrary] = useState<LibItem[]>([]);
   const [muted, setMuted] = useState<Record<string, boolean>>({});
   const [monitored, setMonitored] = useState<Record<string, boolean>>({});
+  const chains = useRef(new Map<string, VoiceChain>()).current;
+  const [fxMap, setFxMap] = useState<Record<string, VoiceFx>>({});
+  const [fxOpen, setFxOpen] = useState<string | null>(null);
   const streamer = useMemo(() => new Streamer(), []);
   const [streamUrl, setStreamUrl] = useState(localStorage.getItem('streamUrl') ?? 'rtmp://a.rtmp.youtube.com/live2');
   const [directMode, setDirectMode] = useState(localStorage.getItem('directMode') !== '0');
@@ -154,7 +158,19 @@ export function App() {
       await s.start();
       compositor.registerSource(s);
       if (s.audioNode) {
-        mixer.attach(s.id, s.audioNode);
+        if (s.kind === 'mic' || s.kind === 'phone-cam') {
+          // Voice strips run the studio chain (HPF→RNNoise→gate→EQ→comp) pre-mixer,
+          // so the strip's meter and gain see the PROCESSED signal.
+          const saved = localStorage.getItem(`voicefx:${s.label}`);
+          const chain = new VoiceChain(mixer.ctx, saved ? { ...DEFAULT_FX, ...JSON.parse(saved) } : undefined);
+          await chain.init();
+          s.audioNode.connect(chain.input);
+          mixer.attach(s.id, chain.output);
+          chains.set(s.id, chain);
+          setFxMap((m) => ({ ...m, [s.id]: chain.settings }));
+        } else {
+          mixer.attach(s.id, s.audioNode);
+        }
         if (s.kind === 'phone-cam') {
           // Remote source: hearing it live is expected (no feedback risk from a far mic).
           mixer.setMonitor(s.id, true);
@@ -194,10 +210,23 @@ export function App() {
     if (!s) return;
     s.stop();
     mixer.detach(id);
+    chains.get(id)?.dispose();
+    chains.delete(id);
+    if (fxOpen === id) setFxOpen(null);
     compositor.unregisterSource(id);
     const next = sources.filter((x) => x.id !== id);
     setSources(next);
     refreshScenes(next, false);
+  }
+
+  function updateFx(id: string, patch: Partial<VoiceFx>) {
+    const chain = chains.get(id);
+    if (!chain) return;
+    const next = { ...chain.settings, ...patch };
+    chain.apply(next);
+    setFxMap((m) => ({ ...m, [id]: next }));
+    const label = sources.find((s) => s.id === id)?.label;
+    if (label) localStorage.setItem(`voicefx:${label}`, JSON.stringify(next));
   }
 
   function toggleRecord() {
@@ -487,6 +516,15 @@ export function App() {
               >
                 🎧
               </a>
+              {chains.has(s.id) && (
+                <a
+                  title="Voice FX: denoise, gate, EQ, compressor"
+                  style={{ cursor: 'pointer', color: fxOpen === s.id || fxMap[s.id]?.enabled ? 'var(--accent2)' : 'var(--dim)', float: 'right', marginRight: 6 }}
+                  onClick={() => setFxOpen(fxOpen === s.id ? null : s.id)}
+                >
+                  🎚️
+                </a>
+              )}
             </div>
             <input
               type="range" min="0" max="1.5" step="0.01" defaultValue="1"
@@ -494,6 +532,52 @@ export function App() {
               onChange={(e) => mixer.setGain(s.id, Number(e.target.value))}
             />
             <div className="meter"><i style={{ width: `${Math.min(100, mixer.peak(s.id) * 140)}%` }} /></div>
+            {fxOpen === s.id && fxMap[s.id] && (
+              <div style={{ fontSize: 11, display: 'grid', gap: 4, padding: '6px 2px 2px', borderTop: '1px solid var(--dim)', marginTop: 4 }}>
+                <label style={{ cursor: 'pointer' }}>
+                  <input type="checkbox" checked={fxMap[s.id].enabled} onChange={(e) => updateFx(s.id, { enabled: e.target.checked })} /> Voice FX chain
+                </label>
+                <label style={{ cursor: 'pointer', opacity: chains.get(s.id)?.denoiseAvailable ? 1 : 0.4 }}>
+                  <input
+                    type="checkbox" checked={fxMap[s.id].denoise} disabled={!chains.get(s.id)?.denoiseAvailable}
+                    onChange={(e) => updateFx(s.id, { denoise: e.target.checked })}
+                  /> ✨ Denoise (RNNoise){!chains.get(s.id)?.denoiseAvailable && ' — unavailable'}
+                </label>
+                <label style={{ cursor: 'pointer' }}>
+                  <input type="checkbox" checked={fxMap[s.id].gate} onChange={(e) => updateFx(s.id, { gate: e.target.checked })} /> Gate {fxMap[s.id].gateDb} dB
+                </label>
+                <input
+                  type="range" min="-70" max="-25" step="1" value={fxMap[s.id].gateDb}
+                  disabled={!fxMap[s.id].gate}
+                  onChange={(e) => updateFx(s.id, { gateDb: Number(e.target.value) })}
+                />
+                <label>Low cut {fxMap[s.id].lowCut} Hz</label>
+                <input
+                  type="range" min="40" max="160" step="5" value={fxMap[s.id].lowCut}
+                  onChange={(e) => updateFx(s.id, { lowCut: Number(e.target.value) })}
+                />
+                <label>
+                  EQ{' '}
+                  <select value={fxMap[s.id].preset} onChange={(e) => updateFx(s.id, { preset: e.target.value as VoiceFx['preset'] })}>
+                    <option value="broadcast">Broadcast</option>
+                    <option value="warm">Warm</option>
+                    <option value="bright">Bright</option>
+                    <option value="flat">Flat</option>
+                  </select>{' '}
+                  <label style={{ cursor: 'pointer' }}>
+                    <input type="checkbox" checked={fxMap[s.id].deEss} onChange={(e) => updateFx(s.id, { deEss: e.target.checked })} /> De-ess
+                  </label>
+                </label>
+                <label style={{ cursor: 'pointer' }}>
+                  <input type="checkbox" checked={fxMap[s.id].comp} onChange={(e) => updateFx(s.id, { comp: e.target.checked })} /> Compressor · makeup +{fxMap[s.id].makeupDb} dB
+                </label>
+                <input
+                  type="range" min="0" max="12" step="1" value={fxMap[s.id].makeupDb}
+                  disabled={!fxMap[s.id].comp}
+                  onChange={(e) => updateFx(s.id, { makeupDb: Number(e.target.value) })}
+                />
+              </div>
+            )}
           </div>
         ))}
         {sources.filter((s) => s.audioNode).length === 0 && (

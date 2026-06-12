@@ -92,8 +92,12 @@ export class MicSource extends BaseSource {
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         deviceId: this.deviceId ? { exact: this.deviceId } : undefined,
-        echoCancellation: true,
-        noiseSuppression: true,
+        // RAW capture: the studio voice chain (HPF→RNNoise→gate→EQ→comp) does the
+        // processing — browser DSP on top causes the "underwater webinar" sound.
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false,
+        channelCount: 1,
       },
     });
     this.audioNode = this.audioCtx.createMediaStreamSource(this.stream);

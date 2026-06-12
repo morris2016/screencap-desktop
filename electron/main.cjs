@@ -336,6 +336,21 @@ ipcMain.handle('stream-stop', () => {
   return true;
 });
 
+// ---- Voice FX assets: worklet code + wasm bytes for the renderer's RNNoise/gate chain.
+// Served over IPC because fetch() can't load file:// URLs from the built renderer. ----
+ipcMain.handle('voicefx-assets', () => {
+  try {
+    const base = path.dirname(require.resolve('@sapphi-red/web-noise-suppressor'));
+    return {
+      rnnoiseWorklet: fs.readFileSync(path.join(base, 'rnnoise', 'workletProcessor.js'), 'utf8'),
+      gateWorklet: fs.readFileSync(path.join(base, 'noiseGate', 'workletProcessor.js'), 'utf8'),
+      rnnoiseWasm: fs.readFileSync(path.join(base, 'rnnoise_simd.wasm')),
+    };
+  } catch (e) {
+    return { error: String(e) };
+  }
+});
+
 app.whenReady().then(() => {
   createWindow();
   link.onStatus = (s) => {

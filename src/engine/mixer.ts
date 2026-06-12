@@ -3,7 +3,8 @@
  * MediaStream destination for the recorder/streamer.
  */
 export class Mixer {
-  readonly ctx = new AudioContext();
+  // 48kHz pinned: RNNoise (voice chain) only operates at 48k; Chromium resamples inputs.
+  readonly ctx = new AudioContext({ sampleRate: 48000 });
   private dest = this.ctx.createMediaStreamDestination();
   private master = this.ctx.createDynamicsCompressor();
   private strips = new Map<string, { gain: GainNode; analyser: AnalyserNode; monitor: GainNode }>();

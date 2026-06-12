@@ -19,4 +19,5 @@ contextBridge.exposeInMainWorld('screencap', {
   onStreamHealth: (cb) => ipcRenderer.on('stream-health', (e, h) => cb(h)),
   onStreamRestarting: (cb) => ipcRenderer.on('stream-restarting', (e, n, reason, delay) => cb(n, reason, delay)),
   onStreamResume: (cb) => ipcRenderer.on('stream-resume', () => cb()),
+  voiceFxAssets: () => ipcRenderer.invoke('voicefx-assets'),
 });
