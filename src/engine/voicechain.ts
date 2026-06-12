@@ -1,49 +1,69 @@
 /**
  * Studio voice chain — the broadcast-standard channel strip, per mic source:
  *
- *   raw mic → HPF (rumble) → RNNoise (neural denoise, same model OBS ships)
+ *   raw mic → HPF (rumble) → RNNoise (neural denoise, wet/dry strength)
  *           → noise gate → 4-band EQ (+ optional de-esser) → compressor + makeup → bus
  *
- * RNNoise runs in an AudioWorklet at 48kHz (the Mixer pins its context there).
- * Assets (worklet JS + wasm) arrive over IPC because fetch() can't load file:// URLs.
+ * Every stage is individually switchable and adjustable. RNNoise runs in an AudioWorklet
+ * at 48kHz (the Mixer pins its context there). Assets (worklet JS + wasm) arrive over IPC
+ * because fetch() can't load file:// URLs.
  */
 import { NoiseGateWorkletNode, RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
 
 export interface VoiceFx {
-  enabled: boolean;
   /** Chromium AEC on the capture track (local mics only) — kills speaker echo re-capture. */
   echoCancel: boolean;
   denoise: boolean;
+  /** Wet/dry mix 0..1 — how much of the denoised signal replaces the raw one. */
+  denoiseStrength: number;
   gate: boolean;
   /** Gate open threshold in dBFS; closes 5dB lower. */
   gateDb: number;
   /** High-pass corner frequency in Hz. */
   lowCut: number;
+  /** Last chosen preset (UI convenience; the band fields are the truth). */
   preset: 'broadcast' | 'warm' | 'bright' | 'flat';
+  /** Individual EQ bands in dB: low shelf 120Hz / peak 250Hz / peak 3kHz / high shelf 12kHz. */
+  eqLow: number;
+  eqMud: number;
+  eqPresence: number;
+  eqAir: number;
   deEss: boolean;
+  /** De-esser cut depth in dB at 6.5kHz. */
+  deEssDb: number;
   comp: boolean;
+  /** Compression drive 0..1 — maps threshold -18→-35dB and ratio 2→6:1 together. */
+  compAmount: number;
   makeupDb: number;
 }
 
+/** [low, mud, presence, air] in dB. */
+export function presetBands(p: VoiceFx['preset']): [number, number, number, number] {
+  switch (p) {
+    case 'broadcast': return [1.5, -2.5, 3, 2];
+    case 'warm': return [3, 1, 0, -1];
+    case 'bright': return [-1, -3, 3.5, 4];
+    default: return [0, 0, 0, 0];
+  }
+}
+
 export const DEFAULT_FX: VoiceFx = {
-  enabled: true,
   echoCancel: true,
   denoise: true,
+  denoiseStrength: 1,
   gate: true,
   gateDb: -45,
   lowCut: 80,
   preset: 'broadcast',
+  eqLow: 1.5,
+  eqMud: -2.5,
+  eqPresence: 3,
+  eqAir: 2,
   deEss: false,
+  deEssDb: 6,
   comp: true,
+  compAmount: 0.6,
   makeupDb: 4,
-};
-
-/** [low-shelf 120Hz, peak 250Hz (mud), peak 3kHz (presence), high-shelf 12kHz (air)] in dB. */
-const EQ_PRESETS: Record<VoiceFx['preset'], [number, number, number, number]> = {
-  flat: [0, 0, 0, 0],
-  broadcast: [1.5, -2.5, 3, 2],
-  warm: [3, 1, 0, -1],
-  bright: [-1, -3, 3.5, 4],
 };
 
 // ---- one-time worklet/wasm bootstrap (shared across all chains on the mixer ctx) ----
@@ -81,6 +101,10 @@ export class VoiceChain {
   private hs: BiquadFilterNode;
   private comp: DynamicsCompressorNode;
   private makeup: GainNode;
+  // Denoise wet/dry mix
+  private dnWet: GainNode;
+  private dnDry: GainNode;
+  private dnSum: GainNode;
   private rnnoise: RnnoiseWorkletNode | null = null;
   private gateNode: NoiseGateWorkletNode | null = null;
   private gateBuiltAtDb = NaN;
@@ -104,16 +128,15 @@ export class VoiceChain {
     this.p1 = biquad('peaking', 250, 1);
     this.p2 = biquad('peaking', 3000, 1);
     this.deEssF = biquad('peaking', 6500, 2.5);
-    this.deEssF.gain.value = -6;
     this.hs = biquad('highshelf', 12000);
-    // Voice compressor: gentle 3.5:1, fast-ish attack, musical release.
     this.comp = ctx.createDynamicsCompressor();
-    this.comp.threshold.value = -28;
     this.comp.knee.value = 10;
-    this.comp.ratio.value = 3.5;
     this.comp.attack.value = 0.005;
     this.comp.release.value = 0.18;
     this.makeup = ctx.createGain();
+    this.dnWet = ctx.createGain();
+    this.dnDry = ctx.createGain();
+    this.dnSum = ctx.createGain();
   }
 
   async init(): Promise<void> {
@@ -135,14 +158,19 @@ export class VoiceChain {
 
   apply(fx: VoiceFx) {
     this.fx = { ...fx };
+    // ---- parameter-only updates (live-safe, no graph interruption) ----
     this.hpf.frequency.value = fx.lowCut;
-    const [lsDb, p1Db, p2Db, hsDb] = EQ_PRESETS[fx.preset];
-    this.ls.gain.value = lsDb;
-    this.p1.gain.value = p1Db;
-    this.p2.gain.value = p2Db;
-    this.hs.gain.value = hsDb;
+    this.ls.gain.value = fx.eqLow;
+    this.p1.gain.value = fx.eqMud;
+    this.p2.gain.value = fx.eqPresence;
+    this.hs.gain.value = fx.eqAir;
+    this.deEssF.gain.value = -Math.abs(fx.deEssDb);
+    this.dnWet.gain.value = fx.denoiseStrength;
+    this.dnDry.gain.value = 1 - fx.denoiseStrength;
+    this.comp.threshold.value = -18 - 17 * fx.compAmount; // 0→-18dB … 1→-35dB
+    this.comp.ratio.value = 2 + 4 * fx.compAmount; //         0→2:1  … 1→6:1
     this.makeup.gain.value = Math.pow(10, fx.makeupDb / 20);
-    // Gate thresholds are construction-time options — rebuild when the slider moves.
+    // ---- gate thresholds are construction-time options — rebuild when committed ----
     let gateRebuilt = false;
     if (fx.gate && this.wasm && this.gateBuiltAtDb !== fx.gateDb) {
       try { this.gateNode?.disconnect(); } catch {}
@@ -156,9 +184,9 @@ export class VoiceChain {
       gateRebuilt = true;
     }
     // Only tear down / reconnect the live path when its SHAPE changes — rewiring on
-    // every param tweak (sliders!) interrupts the graph audibly (field bug: "mic stops").
+    // every param tweak interrupts the graph audibly.
     const topology = [
-      fx.enabled, fx.denoise && !!this.rnnoise, fx.gate && !!this.gateNode, fx.deEss, fx.comp,
+      fx.denoise && !!this.rnnoise, fx.gate && !!this.gateNode, fx.deEss, fx.comp,
     ].join(',');
     if (topology !== this.topology || gateRebuilt) {
       this.topology = topology;
@@ -167,27 +195,46 @@ export class VoiceChain {
   }
 
   private wire() {
-    // NEVER disconnect this.output: its outgoing edge is the mixer-strip connection,
-    // owned by the App — severing it muted the strip on every topology toggle (field
-    // bug: "fx settings make the mic inactive"). disconnect() only cuts OUTGOING edges,
-    // so dropping upstream nodes' edges fully resets the internal chain.
+    // NEVER disconnect this.output: its outgoing edge is the App-owned chain→mixer
+    // connection. disconnect() only cuts OUTGOING edges, so dropping upstream nodes'
+    // edges fully resets the internal chain.
     const nodes: (AudioNode | null)[] = [
       this.input, this.hpf, this.rnnoise, this.gateNode, this.ls, this.p1, this.p2,
-      this.deEssF, this.hs, this.comp, this.makeup,
+      this.deEssF, this.hs, this.comp, this.makeup, this.dnWet, this.dnDry, this.dnSum,
     ];
     for (const n of nodes) { try { n?.disconnect(); } catch {} }
-    const chain: AudioNode[] = [this.input];
-    if (this.fx.enabled) {
-      chain.push(this.hpf);
-      if (this.fx.denoise && this.rnnoise) chain.push(this.rnnoise);
-      if (this.fx.gate && this.gateNode) chain.push(this.gateNode);
-      chain.push(this.ls, this.p1, this.p2);
-      if (this.fx.deEss) chain.push(this.deEssF);
-      chain.push(this.hs);
-      if (this.fx.comp) chain.push(this.comp, this.makeup);
+    let prev: AudioNode = this.input;
+    prev.connect(this.hpf);
+    prev = this.hpf;
+    if (this.fx.denoise && this.rnnoise) {
+      // Wet/dry mix: strength crossfades between denoised and raw.
+      prev.connect(this.rnnoise);
+      this.rnnoise.connect(this.dnWet);
+      prev.connect(this.dnDry);
+      this.dnWet.connect(this.dnSum);
+      this.dnDry.connect(this.dnSum);
+      prev = this.dnSum;
     }
-    chain.push(this.output);
-    for (let i = 0; i < chain.length - 1; i++) chain[i].connect(chain[i + 1]);
+    if (this.fx.gate && this.gateNode) {
+      prev.connect(this.gateNode);
+      prev = this.gateNode;
+    }
+    prev.connect(this.ls);
+    this.ls.connect(this.p1);
+    this.p1.connect(this.p2);
+    prev = this.p2;
+    if (this.fx.deEss) {
+      prev.connect(this.deEssF);
+      prev = this.deEssF;
+    }
+    prev.connect(this.hs);
+    prev = this.hs;
+    if (this.fx.comp) {
+      prev.connect(this.comp);
+      this.comp.connect(this.makeup);
+      prev = this.makeup;
+    }
+    prev.connect(this.output);
   }
 
   dispose() {

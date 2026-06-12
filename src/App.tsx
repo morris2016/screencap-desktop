@@ -5,7 +5,7 @@ import { Mixer } from './engine/mixer';
 import { PhoneSource } from './engine/phonesource';
 import { Recorder, Streamer } from './engine/recorder';
 import { MicSource, ScreenSource, WebcamSource } from './engine/sources';
-import { DEFAULT_FX, VoiceChain, type VoiceFx } from './engine/voicechain';
+import { DEFAULT_FX, presetBands, VoiceChain, type VoiceFx } from './engine/voicechain';
 import type { CaptureSourceInfo, LinkInfo, Scene, SceneItem, Source } from './engine/types';
 
 interface LibItem {
@@ -162,7 +162,14 @@ export function App() {
           // Voice strips run the studio chain (HPF→RNNoise→gate→EQ→comp) pre-mixer,
           // so the strip's meter and gain see the PROCESSED signal.
           const saved = localStorage.getItem(`voicefx:${s.label}`);
-          const chain = new VoiceChain(mixer.ctx, saved ? { ...DEFAULT_FX, ...JSON.parse(saved) } : undefined);
+          const parsed = saved ? JSON.parse(saved) : null;
+          let initial: VoiceFx | undefined = parsed ? { ...DEFAULT_FX, ...parsed } : undefined;
+          if (initial && parsed.eqLow === undefined && parsed.preset) {
+            // v1 settings stored only the preset name — expand it into the band fields.
+            const [lo, mud, pres, air] = presetBands(parsed.preset);
+            initial = { ...initial, eqLow: lo, eqMud: mud, eqPresence: pres, eqAir: air };
+          }
+          const chain = new VoiceChain(mixer.ctx, initial);
           await chain.init();
           s.audioNode.connect(chain.input);
           mixer.attach(s.id, chain.output);
@@ -530,7 +537,7 @@ export function App() {
               {chains.has(s.id) && (
                 <a
                   title="Voice FX: denoise, gate, EQ, compressor"
-                  style={{ cursor: 'pointer', color: fxOpen === s.id || fxMap[s.id]?.enabled ? 'var(--accent2)' : 'var(--dim)', float: 'right', marginRight: 6 }}
+                  style={{ cursor: 'pointer', color: fxOpen === s.id ? 'var(--accent2)' : 'var(--dim)', float: 'right', marginRight: 6 }}
                   onClick={() => setFxOpen(fxOpen === s.id ? null : s.id)}
                 >
                   🎚️
@@ -564,11 +571,8 @@ export function App() {
                     <a style={{ cursor: 'pointer', color: 'var(--dim)' }} onClick={() => setFxOpen(null)}>✕</a>
                   </span>
                 </div>
-                <label style={{ cursor: 'pointer' }}>
-                  <input type="checkbox" checked={fxMap[s.id].enabled} onChange={(e) => updateFx(s.id, { enabled: e.target.checked })} /> Voice FX chain
-                </label>
                 {s.kind === 'mic' && (
-                  <label style={{ cursor: 'pointer' }} title="Cancels your speakers' sound re-entering the mic. Turn off only on headphones.">
+                  <label style={{ cursor: 'pointer' }} title="Cancels your speakers' sound re-entering the mic. On/off only — Chromium AEC has no strength setting. Turn off on headphones.">
                     <input type="checkbox" checked={fxMap[s.id].echoCancel} onChange={(e) => updateFx(s.id, { echoCancel: e.target.checked })} /> 🔁 Echo cancel (speakers)
                   </label>
                 )}
@@ -576,39 +580,70 @@ export function App() {
                   <input
                     type="checkbox" checked={fxMap[s.id].denoise} disabled={!chains.get(s.id)?.denoiseAvailable}
                     onChange={(e) => updateFx(s.id, { denoise: e.target.checked })}
-                  /> ✨ Denoise (RNNoise){!chains.get(s.id)?.denoiseAvailable && ' — unavailable'}
+                  /> ✨ Denoise · {Math.round(fxMap[s.id].denoiseStrength * 100)}%{!chains.get(s.id)?.denoiseAvailable && ' — unavailable'}
                 </label>
+                <input
+                  type="range" min="0" max="1" step="0.05" value={fxMap[s.id].denoiseStrength}
+                  disabled={!fxMap[s.id].denoise}
+                  onChange={(e) => updateFx(s.id, { denoiseStrength: Number(e.target.value) })}
+                />
                 <label style={{ cursor: 'pointer' }}>
-                  <input type="checkbox" checked={fxMap[s.id].gate} onChange={(e) => updateFx(s.id, { gate: e.target.checked })} /> Gate {fxMap[s.id].gateDb} dB
+                  <input type="checkbox" checked={fxMap[s.id].gate} onChange={(e) => updateFx(s.id, { gate: e.target.checked })} /> 🚪 Gate · {fxMap[s.id].gateDb} dB
                 </label>
-                {/* display tracks the drag; the gate worklet rebuild commits on RELEASE —
-                    rebuilding the live audio path per 1dB step caused dropouts */}
+                {/* gate threshold is a construction-time option — commit the rebuild on RELEASE */}
                 <input
                   type="range" min="-70" max="-25" step="1" value={fxMap[s.id].gateDb}
                   disabled={!fxMap[s.id].gate}
                   onChange={(e) => setFxMap((m) => ({ ...m, [s.id]: { ...m[s.id], gateDb: Number(e.target.value) } }))}
                   onPointerUp={(e) => updateFx(s.id, { gateDb: Number((e.target as HTMLInputElement).value) })}
                 />
-                <label>Low cut {fxMap[s.id].lowCut} Hz</label>
+                <label>🌊 Low cut · {fxMap[s.id].lowCut} Hz</label>
                 <input
                   type="range" min="40" max="160" step="5" value={fxMap[s.id].lowCut}
                   onChange={(e) => updateFx(s.id, { lowCut: Number(e.target.value) })}
                 />
                 <label>
-                  EQ{' '}
-                  <select value={fxMap[s.id].preset} onChange={(e) => updateFx(s.id, { preset: e.target.value as VoiceFx['preset'] })}>
+                  🎛️ EQ preset{' '}
+                  <select
+                    value={fxMap[s.id].preset}
+                    onChange={(e) => {
+                      const p = e.target.value as VoiceFx['preset'];
+                      const [lo, mud, pres, air] = presetBands(p);
+                      updateFx(s.id, { preset: p, eqLow: lo, eqMud: mud, eqPresence: pres, eqAir: air });
+                    }}
+                  >
                     <option value="broadcast">Broadcast</option>
                     <option value="warm">Warm</option>
                     <option value="bright">Bright</option>
                     <option value="flat">Flat</option>
-                  </select>{' '}
-                  <label style={{ cursor: 'pointer' }}>
-                    <input type="checkbox" checked={fxMap[s.id].deEss} onChange={(e) => updateFx(s.id, { deEss: e.target.checked })} /> De-ess
-                  </label>
+                  </select>
                 </label>
+                {([['eqLow', 'Low · 120 Hz'], ['eqMud', 'Mud · 250 Hz'], ['eqPresence', 'Presence · 3 kHz'], ['eqAir', 'Air · 12 kHz']] as const).map(([k, lbl]) => (
+                  <React.Fragment key={k}>
+                    <label>{lbl} · {fxMap[s.id][k] > 0 ? '+' : ''}{fxMap[s.id][k]} dB</label>
+                    <input
+                      type="range" min="-12" max="12" step="0.5" value={fxMap[s.id][k]}
+                      onChange={(e) => updateFx(s.id, { [k]: Number(e.target.value) } as Partial<VoiceFx>)}
+                    />
+                  </React.Fragment>
+                ))}
                 <label style={{ cursor: 'pointer' }}>
-                  <input type="checkbox" checked={fxMap[s.id].comp} onChange={(e) => updateFx(s.id, { comp: e.target.checked })} /> Compressor · makeup +{fxMap[s.id].makeupDb} dB
+                  <input type="checkbox" checked={fxMap[s.id].deEss} onChange={(e) => updateFx(s.id, { deEss: e.target.checked })} /> 🦷 De-ess · −{fxMap[s.id].deEssDb} dB
                 </label>
+                <input
+                  type="range" min="2" max="12" step="1" value={fxMap[s.id].deEssDb}
+                  disabled={!fxMap[s.id].deEss}
+                  onChange={(e) => updateFx(s.id, { deEssDb: Number(e.target.value) })}
+                />
+                <label style={{ cursor: 'pointer' }}>
+                  <input type="checkbox" checked={fxMap[s.id].comp} onChange={(e) => updateFx(s.id, { comp: e.target.checked })} /> 🗜️ Compressor · {Math.round(fxMap[s.id].compAmount * 100)}%
+                </label>
+                <input
+                  type="range" min="0" max="1" step="0.05" value={fxMap[s.id].compAmount}
+                  disabled={!fxMap[s.id].comp}
+                  onChange={(e) => updateFx(s.id, { compAmount: Number(e.target.value) })}
+                />
+                <label>Makeup gain · +{fxMap[s.id].makeupDb} dB</label>
                 <input
                   type="range" min="0" max="12" step="1" value={fxMap[s.id].makeupDb}
                   disabled={!fxMap[s.id].comp}
