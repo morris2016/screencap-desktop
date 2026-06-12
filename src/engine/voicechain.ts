@@ -80,6 +80,7 @@ function ensureWorklets(ctx: AudioContext): Promise<ArrayBuffer | null> {
         await mod(a.rnnoiseWorklet);
         await mod(a.gateWorklet);
         const u8 = new Uint8Array(a.rnnoiseWasm);
+        console.log(`[voicefx] worklets ready — RNNoise wasm ${u8.byteLength} bytes, ctx ${ctx.sampleRate}Hz`);
         return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
       } catch (e) {
         console.warn('[voicefx] worklet bootstrap failed — denoise/gate disabled:', e);

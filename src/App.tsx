@@ -238,7 +238,8 @@ export function App() {
     const src = sources.find((s) => s.id === id);
     if (patch.echoCancel !== undefined && src instanceof MicSource) {
       // Re-acquire swaps the source node — reconnect the fresh one into the chain.
-      void src.setEchoCancellation(patch.echoCancel).then((node) => {
+      // While monitoring, AEC stays suspended regardless (it chops self-monitored voice).
+      void src.setEchoCancellation(patch.echoCancel && !monitored[id]).then((node) => {
         const ch = chains.get(id);
         if (node && ch) node.connect(ch.input);
       });
@@ -530,6 +531,15 @@ export function App() {
                   const m = !monitored[s.id];
                   setMonitored({ ...monitored, [s.id]: m });
                   mixer.setMonitor(s.id, m);
+                  // AEC treats self-monitoring as far-end echo and chops the live voice
+                  // (clicks/pauses) — suspend it while this mic is monitored, restore after.
+                  if (s instanceof MicSource && chains.get(s.id) && fxMap[s.id]?.echoCancel) {
+                    void s.setEchoCancellation(!m).then((node) => {
+                      const ch = chains.get(s.id);
+                      if (node && ch) node.connect(ch.input);
+                    });
+                    setStatus(m ? '🎧 monitoring — echo cancel suspended for this mic' : 'echo cancel restored');
+                  }
                 }}
               >
                 🎧
