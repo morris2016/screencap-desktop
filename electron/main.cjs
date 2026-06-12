@@ -152,6 +152,7 @@ const stream = {
   target: null,
   bitrateK: 4000,
   direct: false,        // ddagrab native screen capture (video never touches Chromium)
+  qsvBroken: false,     // QuickSync failed this session — fall back to libx264
   spawnMs: 0,           // watchdog startup-grace anchor
   awaitingFresh: false, // drop stale chunks until a fresh container header arrives
   attempts: 0,
@@ -177,25 +178,48 @@ function spawnStream() {
   // path entirely. Default mode: full A/V MediaRecorder stream over the pipe (scene compositing).
   // probesize/analyzeduration: the audio-only pipe trickles ~16KB/s — don't let the
   // demuxer probe stall startup (webm headers identify opus immediately).
+  const audioPipe = [
+    '-fflags', 'nobuffer', '-probesize', '65536', '-analyzeduration', '500000', '-i', 'pipe:0',
+  ];
+  // Zero-copy GPU pipeline (preferred): the desktop renders on the Intel iGPU, so
+  // ddagrab captures there and QuickSync encodes ON THE SAME DEVICE — video costs the
+  // CPU ~nothing, which is what stops x264 starving Chromium's audio thread (field bug:
+  // audible glitches in recordings ONLY while live). x264 (4 threads, below-normal
+  // priority) remains as the automatic fallback when QSV init fails.
+  const useQsv = stream.direct && !stream.qsvBroken;
   const input = stream.direct
-    ? [
-        '-filter_complex', `ddagrab=framerate=30,hwdownload,format=bgra,scale='min(1920,iw)':-2[v]`,
-        '-fflags', 'nobuffer', '-probesize', '65536', '-analyzeduration', '500000', '-i', 'pipe:0',
-        '-map', '[v]', '-map', '0:a?',
-      ]
+    ? useQsv
+      ? [
+          '-init_hw_device', 'd3d11va=dx', '-init_hw_device', 'qsv=qs@dx', '-filter_hw_device', 'dx',
+          '-filter_complex', 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]',
+          ...audioPipe, '-map', '[v]', '-map', '0:a?',
+        ]
+      : [
+          '-filter_complex', `ddagrab=framerate=30,hwdownload,format=bgra,scale='min(1920,iw)':-2[v]`,
+          ...audioPipe, '-map', '[v]', '-map', '0:a?',
+        ]
     : ['-fflags', 'nobuffer', '-i', 'pipe:0'];
+  const videoEnc = useQsv
+    ? [
+        '-c:v', 'h264_qsv', '-preset', 'fast',
+        '-b:v', `${stream.bitrateK}k`, '-maxrate', `${stream.bitrateK}k`,
+        '-bufsize', `${stream.bitrateK * 2}k`,
+        '-g', '60', '-fps_mode', 'cfr',
+      ]
+    : [
+        '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency',
+        // Half the cores: x264 saturating all 8 starves Chromium's audio thread.
+        '-threads', '4',
+        // True CBR (nal-hrd padding): ABR undershoots on static desktops and YouTube
+        // flags "bitrate lower than recommended". Steady-rate is the broadcast norm.
+        '-b:v', `${stream.bitrateK}k`, '-minrate', `${stream.bitrateK}k`,
+        '-maxrate', `${stream.bitrateK}k`, '-bufsize', `${stream.bitrateK * 2}k`,
+        '-x264-params', 'nal-hrd=cbr',
+        '-g', '60', '-keyint_min', '60', '-pix_fmt', 'yuv420p',
+      ];
   const p = spawn(ff, [
     ...input,
-    '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency',
-    // Half the cores: x264 saturating all 8 starves Chromium's audio thread (wasm
-    // denoisers) — field evidence: recordings glitch ONLY while streaming runs.
-    '-threads', '4',
-    // True CBR (nal-hrd padding): ABR undershoots to ~1.6Mbps on static desktops and
-    // YouTube flags "bitrate lower than recommended". Steady-rate is the broadcast norm.
-    '-b:v', `${stream.bitrateK}k`, '-minrate', `${stream.bitrateK}k`,
-    '-maxrate', `${stream.bitrateK}k`, '-bufsize', `${stream.bitrateK * 2}k`,
-    '-x264-params', 'nal-hrd=cbr',
-    '-g', '60', '-keyint_min', '60', '-pix_fmt', 'yuv420p',
+    ...videoEnc,
     // Direct mode muxes two unsynchronized clocks (ddagrab video vs MediaRecorder audio):
     // aresample=async continuously micro-corrects audio timestamps so players don't
     // rubber-band the audio (field bug: warbly/"shaky" sound on YouTube). Keep native 48k.
@@ -204,6 +228,7 @@ function spawnStream() {
       : ['-c:a', 'aac', '-b:a', '160k', '-ar', '44100']),
     '-f', 'flv', stream.target,
   ]);
+  p.usedQsv = useQsv;
   stream.proc = p;
   // Below-normal priority: ffmpeg gets all SPARE cpu but never preempts the audio
   // engine or UI. Combined with -threads this kills the live-session audio glitching.
@@ -247,6 +272,14 @@ function spawnStream() {
     const reason = recentErr
       .filter((l) => /error|fail|refused|denied|not found|Invalid|I\/O/i.test(l))
       .slice(-2).join(' | ');
+    // QSV died on arrival (bad driver/no iGPU): flip to the x264 path immediately,
+    // without consuming a supervised-restart attempt.
+    if (stream.wanted && p.usedQsv && Date.now() - stream.spawnMs < 3_000) {
+      stream.qsvBroken = true;
+      spawnStream();
+      sendAll('stream-resume');
+      return;
+    }
     if (stream.wanted) {
       scheduleRestart(reason || `exit ${code}`);
     } else {
@@ -312,6 +345,7 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK, direct) => {
   stream.target = `${url.replace(/\/$/, '')}/${key.trim()}`;
   stream.bitrateK = bitrateK;
   stream.direct = !!direct;
+  stream.qsvBroken = false; // re-probe QuickSync each go-live
   stream.wanted = true;
   stream.attempts = 0;
   stream.lastOkMs = 0;
