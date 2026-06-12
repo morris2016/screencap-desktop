@@ -233,7 +233,9 @@ export function App() {
       const display = caps.find((c) => c.isScreen);
       if (display) await addSource(() => new ScreenSource(mixer.ctx, display.id, display.name, true));
     }
-    const err = await streamer.start(compositor.captureStream(30), mixer.stream, url, key, 6000, directMode);
+    // 6800k = YouTube's exact 1080p recommendation; CBR pads to it, so the
+    // "bitrate lower than recommended" ingest warning stays silent.
+    const err = await streamer.start(compositor.captureStream(30), mixer.stream, url, key, 6800, directMode);
     if (err) setStatus(`stream failed: ${err}`);
     else {
       setLive(true);
