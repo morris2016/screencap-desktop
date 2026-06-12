@@ -41,6 +41,11 @@ export class ScreenSource extends BaseSource {
     private captureId: string,
     label: string,
     private withSystemAudio: boolean,
+    /** Keep ONLY the loopback audio: the video track is stopped immediately so the
+     *  Chromium capture pipeline goes idle (direct-mode live needs system sound, not
+     *  a second 1080p30 capture competing with ffmpeg's native one — field bug:
+     *  renderer collapsed to ~10fps while live). */
+    private audioOnly = false,
   ) {
     super('screen', label, audioCtx);
   }
@@ -49,6 +54,7 @@ export class ScreenSource extends BaseSource {
     const constraints: MediaStreamConstraints = {
       video: {
         // Electron's desktop capture path: select the exact display/window by id.
+        // (Windows loopback audio is only granted alongside a desktop video request.)
         mandatory: {
           chromeMediaSource: 'desktop',
           chromeMediaSourceId: this.captureId,
@@ -60,7 +66,11 @@ export class ScreenSource extends BaseSource {
         : false,
     };
     this.stream = await navigator.mediaDevices.getUserMedia(constraints);
-    this.video = makeVideo(this.stream);
+    if (this.audioOnly) {
+      this.stream.getVideoTracks().forEach((t) => t.stop());
+    } else {
+      this.video = makeVideo(this.stream);
+    }
     const at = this.stream.getAudioTracks();
     if (at.length) {
       this.audioNode = this.audioCtx.createMediaStreamSource(new MediaStream([at[0]]));

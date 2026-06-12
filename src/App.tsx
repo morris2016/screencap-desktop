@@ -131,8 +131,8 @@ export function App() {
   });
 
   function refreshScenes(srcs: Source[], keepActive = true) {
-    const screen = srcs.find((s) => s.kind === 'screen');
-    const cam = srcs.find((s) => s.kind === 'webcam' || s.kind === 'phone-cam');
+    const screen = srcs.find((s) => s.kind === 'screen' && s.video);
+    const cam = srcs.find((s) => (s.kind === 'webcam' || s.kind === 'phone-cam') && s.video);
     const presets = presetScenes(screen?.id ?? null, cam?.id ?? null);
     setScenes(presets);
     if (!keepActive || !presets.find((s) => s.id === activeSceneId)) {
@@ -283,10 +283,11 @@ export function App() {
     if (directMode && !sources.some((s) => s.kind === 'screen')) {
       // Direct mode streams without any studio sources — but then the mixer has nothing
       // and the stream goes out SILENT (field bug: YouTube reported audio bitrate 0).
-      // Auto-add the primary display so its system-loopback audio rides the mix.
+      // Auto-add the primary display AUDIO-ONLY: ffmpeg captures the screen natively,
+      // so a second Chromium 1080p capture would just bleed the renderer/iGPU dry.
       const caps = await window.screencap.getCaptureSources();
       const display = caps.find((c) => c.isScreen);
-      if (display) await addSource(() => new ScreenSource(mixer.ctx, display.id, display.name, true));
+      if (display) await addSource(() => new ScreenSource(mixer.ctx, display.id, 'System audio', true, true));
     }
     // 6800k = YouTube's exact 1080p recommendation; CBR pads to it, so the
     // "bitrate lower than recommended" ingest warning stays silent.
