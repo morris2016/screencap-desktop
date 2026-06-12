@@ -189,10 +189,12 @@ export class VoiceChain {
     let gateRebuilt = false;
     if (fx.gate && this.wasm && this.gateBuiltAtDb !== fx.gateDb) {
       try { this.gateNode?.disconnect(); } catch {}
+      // Wide hysteresis + long hold: a tight gate guillotines quiet syllable tails
+      // (field evidence: hard 50-200ms mute slices through speech on the YT VOD).
       this.gateNode = new NoiseGateWorkletNode(this.ctx, {
         openThreshold: fx.gateDb,
-        closeThreshold: fx.gateDb - 5,
-        holdMs: 150,
+        closeThreshold: fx.gateDb - 12,
+        holdMs: 400,
         maxChannels: 2,
       });
       this.gateBuiltAtDb = fx.gateDb;
