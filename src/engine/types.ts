@@ -67,7 +67,8 @@ declare global {
       onStreamHealth(cb: (h: { fps: number; kbps: number; speed: number; attempts: number }) => void): void;
       onStreamRestarting(cb: (attempt: number, reason: string, delayMs: number) => void): void;
       onStreamResume(cb: () => void): void;
-      voiceFxAssets(): Promise<{ rnnoiseWorklet: string; gateWorklet: string; speexWorklet: string; rnnoiseWasm: Uint8Array; speexWasm: Uint8Array; error?: string }>;
+      voiceFxAssets(): Promise<{ rnnoiseWorklet: string; rnnoiseWasm: Uint8Array; error?: string }>;
+      sessionActive(on: boolean): void;
     };
   }
 }

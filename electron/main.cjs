@@ -1,15 +1,25 @@
-const { app, BrowserWindow, ipcMain, dialog, desktopCapturer } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, desktopCapturer, powerSaveBlocker } = require('electron');
 const fs = require('fs');
 const path = require('path');
 const { LinkServer } = require('./linkserver.cjs');
 
-// Chromium's NEW capture backend (Windows Graphics Capture) fails on this class of setup
-// (ProcessFrame E_FAIL floods after display-config changes; field-debugged: frame counter
-// froze while the stream starved). Force the older, battle-tested DXGI duplication capturer.
+// ONE disable-features list — a second appendSwitch('disable-features') call silently
+// OVERWRITES this one and resurrects the WGC E_FAIL capture bug. Two bug classes killed here:
+// 1) WGC capture backend (ProcessFrame E_FAIL floods after display-config changes) — force
+//    the battle-tested DXGI duplication capturer.
+// 2) Renderer background throttling (THE live-audio chop root cause, panel-verified
+//    2026-06-12): when the studio window is occluded/minimized — which is exactly when the
+//    user goes live — Chromium + Win11 EcoQoS demote the renderer hosting the whole audio
+//    engine; the audio thread misses render quanta in ~55ms holes and both MediaRecorder
+//    consumers inherit identical PTS gaps = hard mute slices on YouTube AND local takes.
 app.commandLine.appendSwitch(
   'disable-features',
-  'AllowWgcScreenCapturer,AllowWgcWindowCapturer,WebRtcAllowWgcDesktopCapturer,WebRtcAllowWgcScreenCapturer,WebRtcAllowWgcWindowCapturer',
+  'AllowWgcScreenCapturer,AllowWgcWindowCapturer,WebRtcAllowWgcDesktopCapturer,WebRtcAllowWgcScreenCapturer,WebRtcAllowWgcWindowCapturer,' +
+    'IntensiveWakeUpThrottling,UseEcoQoSForBackgroundProcess',
 );
+app.commandLine.appendSwitch('disable-renderer-backgrounding');
+app.commandLine.appendSwitch('disable-background-timer-throttling');
+app.commandLine.appendSwitch('disable-backgrounding-occluded-windows');
 
 const link = new LinkServer();
 
@@ -21,6 +31,9 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
+      // Keeps rAF (compositor canvas captureStream) and page scheduling alive when the
+      // window is covered — part of the live-audio-chop fix.
+      backgroundThrottling: false,
     },
   });
   win.removeMenu();
@@ -110,7 +123,9 @@ ipcMain.handle('finalize-recording', async (e, arrayBuffer, h264) => {
   const out = path.join(dir, `ScreenCap_${stamp}.mp4`);
   const { spawn } = require('child_process');
   return await new Promise((resolve) => {
-    const p = spawn(ff, ['-y', '-i', tmp, '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k', out]);
+    // aresample=async=1: normalizes the 30-48ms audio timestamp micro-jitter MediaRecorder
+    // leaves even in clean takes (panel measurement).
+    const p = spawn(ff, ['-y', '-i', tmp, '-c:v', 'copy', '-af', 'aresample=async=1:first_pts=0', '-c:a', 'aac', '-b:a', '192k', out]);
     p.on('close', (code) => {
       try { fs.unlinkSync(tmp); } catch {}
       if (code === 0) resolve(out);
@@ -381,6 +396,19 @@ ipcMain.handle('stream-stop', () => {
   return true;
 });
 
+// ---- Session keep-awake: while recording/streaming, the OS must not power-throttle us.
+let psbId = null;
+ipcMain.on('session-active', (e, active) => {
+  try {
+    if (active && psbId === null) {
+      psbId = powerSaveBlocker.start('prevent-app-suspension');
+    } else if (!active && psbId !== null) {
+      powerSaveBlocker.stop(psbId);
+      psbId = null;
+    }
+  } catch {}
+});
+
 // ---- Voice FX assets: worklet code + wasm bytes for the renderer's RNNoise/gate chain.
 // Served over IPC because fetch() can't load file:// URLs from the built renderer. ----
 ipcMain.handle('voicefx-assets', () => {
@@ -388,10 +416,7 @@ ipcMain.handle('voicefx-assets', () => {
     const base = path.dirname(require.resolve('@sapphi-red/web-noise-suppressor'));
     return {
       rnnoiseWorklet: fs.readFileSync(path.join(base, 'rnnoise', 'workletProcessor.js'), 'utf8'),
-      gateWorklet: fs.readFileSync(path.join(base, 'noiseGate', 'workletProcessor.js'), 'utf8'),
-      speexWorklet: fs.readFileSync(path.join(base, 'speex', 'workletProcessor.js'), 'utf8'),
       rnnoiseWasm: fs.readFileSync(path.join(base, 'rnnoise_simd.wasm')),
-      speexWasm: fs.readFileSync(path.join(base, 'speex.wasm')),
     };
   } catch (e) {
     return { error: String(e) };

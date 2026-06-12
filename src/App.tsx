@@ -48,12 +48,21 @@ export function App() {
   const [directMode, setDirectMode] = useState(localStorage.getItem('directMode') !== '0');
   const [streamKey, setStreamKey] = useState(localStorage.getItem('streamKey') ?? '');
   const [live, setLive] = useState(false);
+  const [audioAlert, setAudioAlert] = useState<string | null>(null);
+
+  useEffect(() => {
+    void mixer.startWatchdog(setAudioAlert);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     window.screencap.onLinkStatus((s) => setPhoneConnected(s.phone === 'connected'));
     window.screencap.onStreamEnded((code, reason) => {
       setLive(false);
       streamer.stop();
+      // Release the powerSaveBlocker on autonomous deaths too (review finding: a network
+      // drop or restart-budget exhaustion otherwise left it engaged until app quit).
+      window.screencap.sessionActive(recorder.state !== 'inactive');
       setStatus(
         code === 0
           ? 'stream ended'
@@ -169,12 +178,19 @@ export function App() {
             const [lo, mud, pres, air] = presetBands(parsed.preset);
             initial = { ...initial, eqLow: lo, eqMud: mud, eqPresence: pres, eqAir: air };
           }
-          if (initial && !localStorage.getItem('voicefx-aec-migrated')) {
-            // One-time: settings saved before the AEC-chops-speech finding carried
-            // echoCancel=true forward — force the safe default once; re-enabling sticks.
-            initial = { ...initial, echoCancel: false };
-            localStorage.setItem(`voicefx:${s.label}`, JSON.stringify(initial));
-            localStorage.setItem('voicefx-aec-migrated', '1');
+          if (initial && parsed.fxVersion !== 2) {
+            // v2 migration (panel retune): drop dead keys (deepDenoise) and reset the
+            // stage params the expander/comp redesign was tuned around; user EQ/denoise
+            // preferences survive. echoCancel forced safe (AEC chops live speech).
+            delete (initial as unknown as Record<string, unknown>).deepDenoise;
+            initial = {
+              ...initial,
+              echoCancel: false,
+              gateDb: DEFAULT_FX.gateDb,
+              compAmount: DEFAULT_FX.compAmount,
+              makeupDb: DEFAULT_FX.makeupDb,
+            };
+            localStorage.setItem(`voicefx:${s.label}`, JSON.stringify({ ...initial, fxVersion: 2 }));
           }
           const chain = new VoiceChain(mixer.ctx, initial);
           await chain.init();
@@ -182,9 +198,10 @@ export function App() {
           mixer.attach(s.id, chain.output);
           chains.set(s.id, chain);
           setFxMap((m) => ({ ...m, [s.id]: chain.settings }));
-          // Capture-track AEC default is ON; honor a persisted OFF (re-acquire swaps the node).
-          if (s instanceof MicSource && !chain.settings.echoCancel) {
-            void s.setEchoCancellation(false).then((node) => node?.connect(chain.input));
+          // Capture starts AEC-free (adaptive AEC chops live speech); a deliberate
+          // persisted ON gets a re-acquire with it enabled.
+          if (s instanceof MicSource && chain.settings.echoCancel) {
+            void s.setEchoCancellation(true).then((node) => node?.connect(chain.input));
           }
         } else {
           mixer.attach(s.id, s.audioNode);
@@ -252,13 +269,14 @@ export function App() {
       });
     }
     setFxMap((m) => ({ ...m, [id]: next }));
-    if (src) localStorage.setItem(`voicefx:${src.label}`, JSON.stringify(next));
+    if (src) localStorage.setItem(`voicefx:${src.label}`, JSON.stringify({ ...next, fxVersion: 2 }));
   }
 
   function toggleRecord() {
     if (recorder.state !== 'inactive') {
       recorder.stop();
       setRecState('inactive');
+      window.screencap.sessionActive(live);
       return;
     }
     recorder.start(compositor.captureStream(30), mixer.stream, (saved) => {
@@ -266,6 +284,7 @@ export function App() {
       void refreshLibrary();
     });
     setRecState('recording');
+    window.screencap.sessionActive(true); // powerSaveBlocker for the session
   }
 
   async function goLive(url: string, key: string) {
@@ -273,6 +292,7 @@ export function App() {
       streamer.stop();
       setLive(false);
       setStatus('stream stopped');
+      window.screencap.sessionActive(recorder.state !== 'inactive');
       return;
     }
     if (!key) {
@@ -296,6 +316,7 @@ export function App() {
     else {
       setLive(true);
       setStatus(directMode ? '🔴 connecting… (direct native capture)' : '🔴 connecting…');
+      window.screencap.sessionActive(true);
     }
   }
 
@@ -428,6 +449,17 @@ export function App() {
           <button className="add" onClick={testLocal}>🧪 Test stream (local harness)</button>
         </div>
 
+        {audioAlert && (
+          <div
+            style={{
+              position: 'fixed', top: 8, left: '50%', transform: 'translateX(-50%)', zIndex: 100,
+              background: '#7f1d1d', color: '#fff', border: '1px solid #ef4444', borderRadius: 8,
+              padding: '8px 16px', fontSize: 13, fontWeight: 600, boxShadow: '0 4px 20px rgba(0,0,0,.5)',
+            }}
+          >
+            {audioAlert}
+          </div>
+        )}
         <div className="preview-wrap">
           <div
             className="preview"
@@ -610,21 +642,13 @@ export function App() {
                   disabled={!fxMap[s.id].denoise}
                   onChange={(e) => updateFx(s.id, { denoiseStrength: Number(e.target.value) })}
                 />
-                <label style={{ cursor: 'pointer', opacity: chains.get(s.id)?.denoiseAvailable ? 1 : 0.4 }} title="Second spectral denoiser (Speex) after RNNoise — catches residual steady hiss.">
-                  <input
-                    type="checkbox" checked={fxMap[s.id].deepDenoise} disabled={!chains.get(s.id)?.denoiseAvailable}
-                    onChange={(e) => updateFx(s.id, { deepDenoise: e.target.checked })}
-                  /> 🧹 Deep denoise (hiss)
-                </label>
-                <label style={{ cursor: 'pointer' }}>
+                <label style={{ cursor: 'pointer' }} title="Smooth expander — reduces room noise between phrases to −20dB (never hard-mutes).">
                   <input type="checkbox" checked={fxMap[s.id].gate} onChange={(e) => updateFx(s.id, { gate: e.target.checked })} /> 🚪 Gate · {fxMap[s.id].gateDb} dB
                 </label>
-                {/* gate threshold is a construction-time option — commit the rebuild on RELEASE */}
                 <input
                   type="range" min="-70" max="-25" step="1" value={fxMap[s.id].gateDb}
                   disabled={!fxMap[s.id].gate}
-                  onChange={(e) => setFxMap((m) => ({ ...m, [s.id]: { ...m[s.id], gateDb: Number(e.target.value) } }))}
-                  onPointerUp={(e) => updateFx(s.id, { gateDb: Number((e.target as HTMLInputElement).value) })}
+                  onChange={(e) => updateFx(s.id, { gateDb: Number(e.target.value) })}
                 />
                 <label>🌊 Low cut · {fxMap[s.id].lowCut} Hz</label>
                 <input

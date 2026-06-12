@@ -102,10 +102,11 @@ export class MicSource extends BaseSource {
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         deviceId: this.deviceId ? { exact: this.deviceId } : undefined,
-        // AEC ON by default (speaker setups re-capture their own output as echo);
+        // AEC OFF at creation (panel finding: a fresh mic must never run adaptive AEC,
+        // which diverges and chops live speech; users who enable it get a re-acquire);
         // NS/AGC OFF — the studio voice chain (HPF→RNNoise→gate→EQ→comp) does that
         // processing, and browser DSP on top causes the "underwater webinar" sound.
-        echoCancellation: true,
+        echoCancellation: false,
         noiseSuppression: false,
         autoGainControl: false,
         channelCount: 1,
