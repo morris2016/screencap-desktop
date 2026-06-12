@@ -167,9 +167,13 @@ export class VoiceChain {
   }
 
   private wire() {
+    // NEVER disconnect this.output: its outgoing edge is the mixer-strip connection,
+    // owned by the App — severing it muted the strip on every topology toggle (field
+    // bug: "fx settings make the mic inactive"). disconnect() only cuts OUTGOING edges,
+    // so dropping upstream nodes' edges fully resets the internal chain.
     const nodes: (AudioNode | null)[] = [
       this.input, this.hpf, this.rnnoise, this.gateNode, this.ls, this.p1, this.p2,
-      this.deEssF, this.hs, this.comp, this.makeup, this.output,
+      this.deEssF, this.hs, this.comp, this.makeup,
     ];
     for (const n of nodes) { try { n?.disconnect(); } catch {} }
     const chain: AudioNode[] = [this.input];

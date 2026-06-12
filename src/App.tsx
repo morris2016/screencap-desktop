@@ -555,7 +555,14 @@ export function App() {
               >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                   <b>🎚️ {s.label}</b>
-                  <a style={{ cursor: 'pointer', color: 'var(--dim)' }} onClick={() => setFxOpen(null)}>✕</a>
+                  <span style={{ display: 'flex', gap: 10 }}>
+                    <a
+                      title="Reset to the tuned broadcast defaults"
+                      style={{ cursor: 'pointer', color: 'var(--accent2)' }}
+                      onClick={() => updateFx(s.id, { ...DEFAULT_FX })}
+                    >↺ optimal</a>
+                    <a style={{ cursor: 'pointer', color: 'var(--dim)' }} onClick={() => setFxOpen(null)}>✕</a>
+                  </span>
                 </div>
                 <label style={{ cursor: 'pointer' }}>
                   <input type="checkbox" checked={fxMap[s.id].enabled} onChange={(e) => updateFx(s.id, { enabled: e.target.checked })} /> Voice FX chain
