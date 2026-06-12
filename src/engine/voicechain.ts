@@ -11,6 +11,8 @@ import { NoiseGateWorkletNode, RnnoiseWorkletNode } from '@sapphi-red/web-noise-
 
 export interface VoiceFx {
   enabled: boolean;
+  /** Chromium AEC on the capture track (local mics only) — kills speaker echo re-capture. */
+  echoCancel: boolean;
   denoise: boolean;
   gate: boolean;
   /** Gate open threshold in dBFS; closes 5dB lower. */
@@ -25,6 +27,7 @@ export interface VoiceFx {
 
 export const DEFAULT_FX: VoiceFx = {
   enabled: true,
+  echoCancel: true,
   denoise: true,
   gate: true,
   gateDb: -45,

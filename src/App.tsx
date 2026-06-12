@@ -168,6 +168,8 @@ export function App() {
           mixer.attach(s.id, chain.output);
           chains.set(s.id, chain);
           setFxMap((m) => ({ ...m, [s.id]: chain.settings }));
+          // Capture-track AEC default is ON; honor a persisted OFF.
+          if (s instanceof MicSource && !chain.settings.echoCancel) void s.setEchoCancellation(false);
         } else {
           mixer.attach(s.id, s.audioNode);
         }
@@ -224,9 +226,12 @@ export function App() {
     if (!chain) return;
     const next = { ...chain.settings, ...patch };
     chain.apply(next);
+    const src = sources.find((s) => s.id === id);
+    if (patch.echoCancel !== undefined && src instanceof MicSource) {
+      void src.setEchoCancellation(patch.echoCancel);
+    }
     setFxMap((m) => ({ ...m, [id]: next }));
-    const label = sources.find((s) => s.id === id)?.label;
-    if (label) localStorage.setItem(`voicefx:${label}`, JSON.stringify(next));
+    if (src) localStorage.setItem(`voicefx:${src.label}`, JSON.stringify(next));
   }
 
   function toggleRecord() {
@@ -533,10 +538,27 @@ export function App() {
             />
             <div className="meter"><i style={{ width: `${Math.min(100, mixer.peak(s.id) * 140)}%` }} /></div>
             {fxOpen === s.id && fxMap[s.id] && (
-              <div style={{ fontSize: 11, display: 'grid', gap: 4, padding: '6px 2px 2px', borderTop: '1px solid var(--dim)', marginTop: 4 }}>
+              <div
+                style={{
+                  position: 'fixed', bottom: 110, left: 16, width: 280, zIndex: 60,
+                  background: '#15151d', border: '1px solid #333', borderRadius: 10,
+                  padding: 12, boxShadow: '0 8px 30px rgba(0,0,0,.55)',
+                  maxHeight: '70vh', overflowY: 'auto',
+                  fontSize: 12, display: 'grid', gap: 6,
+                }}
+              >
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <b>🎚️ {s.label}</b>
+                  <a style={{ cursor: 'pointer', color: 'var(--dim)' }} onClick={() => setFxOpen(null)}>✕</a>
+                </div>
                 <label style={{ cursor: 'pointer' }}>
                   <input type="checkbox" checked={fxMap[s.id].enabled} onChange={(e) => updateFx(s.id, { enabled: e.target.checked })} /> Voice FX chain
                 </label>
+                {s.kind === 'mic' && (
+                  <label style={{ cursor: 'pointer' }} title="Cancels your speakers' sound re-entering the mic. Turn off only on headphones.">
+                    <input type="checkbox" checked={fxMap[s.id].echoCancel} onChange={(e) => updateFx(s.id, { echoCancel: e.target.checked })} /> 🔁 Echo cancel (speakers)
+                  </label>
+                )}
                 <label style={{ cursor: 'pointer', opacity: chains.get(s.id)?.denoiseAvailable ? 1 : 0.4 }}>
                   <input
                     type="checkbox" checked={fxMap[s.id].denoise} disabled={!chains.get(s.id)?.denoiseAvailable}

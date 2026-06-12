@@ -92,14 +92,27 @@ export class MicSource extends BaseSource {
     this.stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         deviceId: this.deviceId ? { exact: this.deviceId } : undefined,
-        // RAW capture: the studio voice chain (HPF→RNNoise→gate→EQ→comp) does the
-        // processing — browser DSP on top causes the "underwater webinar" sound.
-        echoCancellation: false,
+        // AEC ON by default (speaker setups re-capture their own output as echo);
+        // NS/AGC OFF — the studio voice chain (HPF→RNNoise→gate→EQ→comp) does that
+        // processing, and browser DSP on top causes the "underwater webinar" sound.
+        echoCancellation: true,
         noiseSuppression: false,
         autoGainControl: false,
         channelCount: 1,
       },
     });
     this.audioNode = this.audioCtx.createMediaStreamSource(this.stream);
+  }
+
+  /** Live AEC flip — no restart; Chromium applies it on the running track. */
+  async setEchoCancellation(on: boolean): Promise<void> {
+    const t = this.stream?.getAudioTracks()[0];
+    if (t) {
+      await t.applyConstraints({
+        echoCancellation: on,
+        noiseSuppression: false,
+        autoGainControl: false,
+      });
+    }
   }
 }
