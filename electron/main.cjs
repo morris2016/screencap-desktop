@@ -152,6 +152,8 @@ const stream = {
   target: null,
   bitrateK: 4000,
   direct: false,        // ddagrab native screen capture (video never touches Chromium)
+  spawnMs: 0,           // watchdog startup-grace anchor
+  awaitingFresh: false, // drop stale chunks until a fresh container header arrives
   attempts: 0,
   lastOkMs: 0,
   lastProgressMs: 0,
@@ -173,38 +175,49 @@ function spawnStream() {
   // Direct mode: video is captured NATIVELY by ffmpeg (Desktop Duplication API via ddagrab)
   // and only mixer audio rides the pipe — Chromium's flaky WGC capture is out of the video
   // path entirely. Default mode: full A/V MediaRecorder stream over the pipe (scene compositing).
+  // probesize/analyzeduration: the audio-only pipe trickles ~16KB/s — don't let the
+  // demuxer probe stall startup (webm headers identify opus immediately).
   const input = stream.direct
     ? [
         '-filter_complex', `ddagrab=framerate=30,hwdownload,format=bgra,scale='min(1920,iw)':-2[v]`,
-        '-fflags', 'nobuffer', '-i', 'pipe:0',
+        '-fflags', 'nobuffer', '-probesize', '65536', '-analyzeduration', '500000', '-i', 'pipe:0',
         '-map', '[v]', '-map', '0:a?',
       ]
     : ['-fflags', 'nobuffer', '-i', 'pipe:0'];
   const p = spawn(ff, [
     ...input,
     '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency',
-    '-b:v', `${stream.bitrateK}k`, '-maxrate', `${stream.bitrateK}k`,
-    '-bufsize', `${stream.bitrateK * 2}k`,
+    // True CBR (nal-hrd padding): ABR undershoots to ~1.6Mbps on static desktops and
+    // YouTube flags "bitrate lower than recommended". Steady-rate is the broadcast norm.
+    '-b:v', `${stream.bitrateK}k`, '-minrate', `${stream.bitrateK}k`,
+    '-maxrate', `${stream.bitrateK}k`, '-bufsize', `${stream.bitrateK * 2}k`,
+    '-x264-params', 'nal-hrd=cbr',
     '-g', '60', '-keyint_min', '60', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', '160k', '-ar', '44100',
     '-f', 'flv', stream.target,
   ]);
   stream.proc = p;
+  stream.spawnMs = Date.now();
   stream.lastProgressMs = Date.now();
+  stream.awaitingFresh = true; // gate stdin until a fresh container header arrives
   p.stdin.on('error', () => {});
   p.on('error', () => {});
   p.stderr.on('data', (d) => {
     const s = d.toString();
     recentErr = recentErr.concat(s.split('\n').filter(Boolean)).slice(-8);
     try { fs.appendFileSync(logPath, s); } catch {}
-    // Health: "frame= 123 fps= 30 ... bitrate=4012.3kbits/s ... speed=1.01x"
-    const m = s.match(/frame=\s*(\d+).*?fps=\s*([\d.]+).*?bitrate=\s*([\d.]+)kbits\/s.*?speed=\s*([\d.]+)x/s);
-    if (m) {
-      stream.lastProgressMs = Date.now();
-      stream.lastSpeed = parseFloat(m[4]);
+    // ANY frame= line is proof of life — startup lines read "bitrate=N/A speed=N/A"
+    // and must still feed the stall detector (field bug: watchdog killed healthy startups).
+    if (/frame=\s*\d+/.test(s)) stream.lastProgressMs = Date.now();
+    // Health fields parsed individually, tolerating N/A during startup.
+    const fps = s.match(/fps=\s*([\d.]+)/);
+    const kbps = s.match(/bitrate=\s*([\d.]+)kbits\/s/);
+    const speed = s.match(/speed=\s*([\d.]+)x/);
+    if (speed) {
+      stream.lastSpeed = parseFloat(speed[1]);
       sendAll('stream-health', {
-        fps: parseFloat(m[2]),
-        kbps: Math.round(parseFloat(m[3])),
+        fps: fps ? parseFloat(fps[1]) : 0,
+        kbps: kbps ? Math.round(parseFloat(kbps[1])) : 0,
         speed: stream.lastSpeed,
         attempts: stream.attempts,
       });
@@ -253,6 +266,9 @@ function startWatchdog() {
   stopWatchdog();
   stream.watchdog = setInterval(() => {
     if (!stream.wanted || !stream.proc) return;
+    // Startup grace: ffmpeg's speed= is a CUMULATIVE average that ramps 0.3x→1.0x over
+    // ~15s (init cost amortizes in). Judging it before 20s kills healthy startups.
+    if (Date.now() - stream.spawnMs < 20_000) return;
     const stalled = Date.now() - stream.lastProgressMs > 5_000;
     if (stream.lastSpeed < 0.9) {
       if (!stream.slowSinceMs) stream.slowSinceMs = Date.now();
@@ -294,7 +310,16 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK, direct) => {
 });
 ipcMain.on('stream-chunk', (e, chunk) => {
   try {
-    if (stream.proc?.stdin.writable) stream.proc.stdin.write(Buffer.from(chunk));
+    if (!stream.proc?.stdin.writable) return;
+    const buf = Buffer.from(chunk);
+    if (stream.awaitingFresh) {
+      // A fresh MediaRecorder's first chunk starts with the EBML magic. Stale in-flight
+      // chunks from the PREVIOUS recorder don't — and they poisoned restarted ffmpeg's
+      // probe ("mp3 ... Invalid data", field bug). Drop until the new container begins.
+      if (!(buf[0] === 0x1a && buf[1] === 0x45 && buf[2] === 0xdf && buf[3] === 0xa3)) return;
+      stream.awaitingFresh = false;
+    }
+    stream.proc.stdin.write(buf);
   } catch {}
 });
 ipcMain.handle('stream-stop', () => {

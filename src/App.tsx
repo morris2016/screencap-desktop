@@ -225,7 +225,15 @@ export function App() {
       return;
     }
     setStatus('starting stream…');
-    const err = await streamer.start(compositor.captureStream(30), mixer.stream, url, key, 4000, directMode);
+    if (directMode && !sources.some((s) => s.kind === 'screen')) {
+      // Direct mode streams without any studio sources — but then the mixer has nothing
+      // and the stream goes out SILENT (field bug: YouTube reported audio bitrate 0).
+      // Auto-add the primary display so its system-loopback audio rides the mix.
+      const caps = await window.screencap.getCaptureSources();
+      const display = caps.find((c) => c.isScreen);
+      if (display) await addSource(() => new ScreenSource(mixer.ctx, display.id, display.name, true));
+    }
+    const err = await streamer.start(compositor.captureStream(30), mixer.stream, url, key, 6000, directMode);
     if (err) setStatus(`stream failed: ${err}`);
     else {
       setLive(true);
