@@ -349,7 +349,9 @@ ipcMain.handle('voicefx-assets', () => {
     return {
       rnnoiseWorklet: fs.readFileSync(path.join(base, 'rnnoise', 'workletProcessor.js'), 'utf8'),
       gateWorklet: fs.readFileSync(path.join(base, 'noiseGate', 'workletProcessor.js'), 'utf8'),
+      speexWorklet: fs.readFileSync(path.join(base, 'speex', 'workletProcessor.js'), 'utf8'),
       rnnoiseWasm: fs.readFileSync(path.join(base, 'rnnoise_simd.wasm')),
+      speexWasm: fs.readFileSync(path.join(base, 'speex.wasm')),
     };
   } catch (e) {
     return { error: String(e) };

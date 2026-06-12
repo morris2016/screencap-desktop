@@ -581,6 +581,11 @@ export function App() {
                     <a style={{ cursor: 'pointer', color: 'var(--dim)' }} onClick={() => setFxOpen(null)}>✕</a>
                   </span>
                 </div>
+                <label>🎚 Input trim · {fxMap[s.id].inputDb > 0 ? '+' : ''}{fxMap[s.id].inputDb} dB</label>
+                <input
+                  type="range" min="-12" max="12" step="1" value={fxMap[s.id].inputDb}
+                  onChange={(e) => updateFx(s.id, { inputDb: Number(e.target.value) })}
+                />
                 {s.kind === 'mic' && (
                   <label style={{ cursor: 'pointer' }} title="Cancels your speakers' sound re-entering the mic. On/off only — Chromium AEC has no strength setting. Turn off on headphones.">
                     <input type="checkbox" checked={fxMap[s.id].echoCancel} onChange={(e) => updateFx(s.id, { echoCancel: e.target.checked })} /> 🔁 Echo cancel (speakers)
@@ -597,6 +602,12 @@ export function App() {
                   disabled={!fxMap[s.id].denoise}
                   onChange={(e) => updateFx(s.id, { denoiseStrength: Number(e.target.value) })}
                 />
+                <label style={{ cursor: 'pointer', opacity: chains.get(s.id)?.denoiseAvailable ? 1 : 0.4 }} title="Second spectral denoiser (Speex) after RNNoise — catches residual steady hiss.">
+                  <input
+                    type="checkbox" checked={fxMap[s.id].deepDenoise} disabled={!chains.get(s.id)?.denoiseAvailable}
+                    onChange={(e) => updateFx(s.id, { deepDenoise: e.target.checked })}
+                  /> 🧹 Deep denoise (hiss)
+                </label>
                 <label style={{ cursor: 'pointer' }}>
                   <input type="checkbox" checked={fxMap[s.id].gate} onChange={(e) => updateFx(s.id, { gate: e.target.checked })} /> 🚪 Gate · {fxMap[s.id].gateDb} dB
                 </label>

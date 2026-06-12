@@ -8,12 +8,16 @@
  * at 48kHz (the Mixer pins its context there). Assets (worklet JS + wasm) arrive over IPC
  * because fetch() can't load file:// URLs.
  */
-import { NoiseGateWorkletNode, RnnoiseWorkletNode } from '@sapphi-red/web-noise-suppressor';
+import { NoiseGateWorkletNode, RnnoiseWorkletNode, SpeexWorkletNode } from '@sapphi-red/web-noise-suppressor';
 
 export interface VoiceFx {
+  /** Pre-chain gain trim in dB — gain staging for hot/quiet capture levels. */
+  inputDb: number;
   /** Chromium AEC on the capture track (local mics only) — kills speaker echo re-capture. */
   echoCancel: boolean;
   denoise: boolean;
+  /** Second-stage spectral denoiser (Speex) — catches steady hiss RNNoise lets through. */
+  deepDenoise: boolean;
   /** Wet/dry mix 0..1 — how much of the denoised signal replaces the raw one. */
   denoiseStrength: number;
   gate: boolean;
@@ -48,8 +52,10 @@ export function presetBands(p: VoiceFx['preset']): [number, number, number, numb
 }
 
 export const DEFAULT_FX: VoiceFx = {
+  inputDb: 0,
   echoCancel: true,
   denoise: true,
+  deepDenoise: true,
   denoiseStrength: 1,
   gate: true,
   gateDb: -45,
@@ -67,9 +73,10 @@ export const DEFAULT_FX: VoiceFx = {
 };
 
 // ---- one-time worklet/wasm bootstrap (shared across all chains on the mixer ctx) ----
-let bootstrap: Promise<ArrayBuffer | null> | null = null;
+type FxWasm = { rnnoise: ArrayBuffer; speex: ArrayBuffer };
+let bootstrap: Promise<FxWasm | null> | null = null;
 
-function ensureWorklets(ctx: AudioContext): Promise<ArrayBuffer | null> {
+function ensureWorklets(ctx: AudioContext): Promise<FxWasm | null> {
   if (!bootstrap) {
     bootstrap = (async () => {
       try {
@@ -79,9 +86,13 @@ function ensureWorklets(ctx: AudioContext): Promise<ArrayBuffer | null> {
           ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([code], { type: 'text/javascript' })));
         await mod(a.rnnoiseWorklet);
         await mod(a.gateWorklet);
-        const u8 = new Uint8Array(a.rnnoiseWasm);
-        console.log(`[voicefx] worklets ready — RNNoise wasm ${u8.byteLength} bytes, ctx ${ctx.sampleRate}Hz`);
-        return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+        await mod(a.speexWorklet);
+        const toBuf = (u8raw: Uint8Array) => {
+          const u8 = new Uint8Array(u8raw);
+          return u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+        };
+        console.log(`[voicefx] worklets ready — RNNoise+Speex+gate, ctx ${ctx.sampleRate}Hz`);
+        return { rnnoise: toBuf(a.rnnoiseWasm), speex: toBuf(a.speexWasm) };
       } catch (e) {
         console.warn('[voicefx] worklet bootstrap failed — denoise/gate disabled:', e);
         return null;
@@ -107,9 +118,10 @@ export class VoiceChain {
   private dnDry: GainNode;
   private dnSum: GainNode;
   private rnnoise: RnnoiseWorkletNode | null = null;
+  private speex: SpeexWorkletNode | null = null;
   private gateNode: NoiseGateWorkletNode | null = null;
   private gateBuiltAtDb = NaN;
-  private wasm: ArrayBuffer | null = null;
+  private wasm: FxWasm | null = null;
   private fx: VoiceFx;
   private topology = '';
 
@@ -143,7 +155,8 @@ export class VoiceChain {
   async init(): Promise<void> {
     this.wasm = await ensureWorklets(this.ctx);
     if (this.wasm && this.ctx.sampleRate === 48000) {
-      this.rnnoise = new RnnoiseWorkletNode(this.ctx, { maxChannels: 2, wasmBinary: this.wasm });
+      this.rnnoise = new RnnoiseWorkletNode(this.ctx, { maxChannels: 2, wasmBinary: this.wasm.rnnoise });
+      this.speex = new SpeexWorkletNode(this.ctx, { maxChannels: 2, wasmBinary: this.wasm.speex });
     }
     this.apply(this.fx);
   }
@@ -160,6 +173,7 @@ export class VoiceChain {
   apply(fx: VoiceFx) {
     this.fx = { ...fx };
     // ---- parameter-only updates (live-safe, no graph interruption) ----
+    this.input.gain.value = Math.pow(10, fx.inputDb / 20);
     this.hpf.frequency.value = fx.lowCut;
     this.ls.gain.value = fx.eqLow;
     this.p1.gain.value = fx.eqMud;
@@ -187,7 +201,8 @@ export class VoiceChain {
     // Only tear down / reconnect the live path when its SHAPE changes — rewiring on
     // every param tweak interrupts the graph audibly.
     const topology = [
-      fx.denoise && !!this.rnnoise, fx.gate && !!this.gateNode, fx.deEss, fx.comp,
+      fx.denoise && !!this.rnnoise, fx.deepDenoise && !!this.speex,
+      fx.gate && !!this.gateNode, fx.deEss, fx.comp,
     ].join(',');
     if (topology !== this.topology || gateRebuilt) {
       this.topology = topology;
@@ -200,7 +215,7 @@ export class VoiceChain {
     // connection. disconnect() only cuts OUTGOING edges, so dropping upstream nodes'
     // edges fully resets the internal chain.
     const nodes: (AudioNode | null)[] = [
-      this.input, this.hpf, this.rnnoise, this.gateNode, this.ls, this.p1, this.p2,
+      this.input, this.hpf, this.rnnoise, this.speex, this.gateNode, this.ls, this.p1, this.p2,
       this.deEssF, this.hs, this.comp, this.makeup, this.dnWet, this.dnDry, this.dnSum,
     ];
     for (const n of nodes) { try { n?.disconnect(); } catch {} }
@@ -215,6 +230,11 @@ export class VoiceChain {
       this.dnWet.connect(this.dnSum);
       this.dnDry.connect(this.dnSum);
       prev = this.dnSum;
+    }
+    if (this.fx.deepDenoise && this.speex) {
+      // Spectral pass after the neural one — mops up steady hiss RNNoise leaves.
+      prev.connect(this.speex);
+      prev = this.speex;
     }
     if (this.fx.gate && this.gateNode) {
       prev.connect(this.gateNode);
@@ -242,6 +262,7 @@ export class VoiceChain {
     try { this.input.disconnect(); } catch {}
     try { this.output.disconnect(); } catch {}
     try { this.rnnoise?.destroy(); } catch {}
+    try { this.speex?.destroy(); } catch {}
     try { this.gateNode?.disconnect(); } catch {}
   }
 }
