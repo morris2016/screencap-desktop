@@ -57,6 +57,12 @@ export function App() {
 
   useEffect(() => {
     window.screencap.onLinkStatus((s) => setPhoneConnected(s.phone === 'connected'));
+    window.screencap.onNativeRecordFailed(() => {
+      // Native recorder died on arrival (QSV/dshow init) — fall back transparently.
+      nativeRecStart.current = null;
+      setStatus('native recorder unavailable — using studio recorder');
+      legacyRecord();
+    });
     window.screencap.onStreamEnded((code, reason) => {
       setLive(false);
       streamer.stop();
@@ -94,7 +100,7 @@ export function App() {
   // Timer + meters tick.
   useEffect(() => {
     const iv = setInterval(() => {
-      setElapsed(recorder.elapsedMs);
+      setElapsed(nativeRecStart.current !== null ? Date.now() - nativeRecStart.current : recorder.elapsedMs);
       force((x) => x + 1); // meters redraw
     }, 200);
     return () => clearInterval(iv);
@@ -272,19 +278,51 @@ export function App() {
     if (src) localStorage.setItem(`voicefx:${src.label}`, JSON.stringify({ ...next, fxVersion: 2 }));
   }
 
-  function toggleRecord() {
+  const nativeRecStart = useRef<number | null>(null);
+
+  function legacyRecord() {
+    recorder.start(compositor.captureStream(30), mixer.stream, (saved) => {
+      setStatus(saved ? `saved → ${saved}` : 'save failed');
+      void refreshLibrary();
+    });
+    setRecState('recording');
+    window.screencap.sessionActive(true);
+  }
+
+  async function toggleRecord() {
+    if (nativeRecStart.current !== null) {
+      // Stop native recording: clean ffmpeg shutdown + remux.
+      nativeRecStart.current = null;
+      setRecState('inactive');
+      const saved = await window.screencap.nativeRecordStop();
+      window.screencap.sessionActive(live);
+      setStatus(saved ? `saved → ${saved}` : 'save failed');
+      void refreshLibrary();
+      return;
+    }
     if (recorder.state !== 'inactive') {
       recorder.stop();
       setRecState('inactive');
       window.screencap.sessionActive(live);
       return;
     }
-    recorder.start(compositor.captureStream(30), mixer.stream, (saved) => {
-      setStatus(saved ? `saved → ${saved}` : 'save failed');
-      void refreshLibrary();
-    });
-    setRecState('recording');
-    window.screencap.sessionActive(true); // powerSaveBlocker for the session
+    // Native-first (throttle-proof, panel plan B): direct mode + a mic in the studio →
+    // ffmpeg records screen + mic + voice chain itself. Scene mode (or no mic, e.g.
+    // phone-audio setups) keeps the compositor/MediaRecorder path.
+    const mic = sources.find((s) => s.kind === 'mic');
+    if (directMode && mic) {
+      const res = await window.screencap.nativeRecordStart(
+        mic.label, chains.get(mic.id)?.settings ?? null,
+      );
+      if (res.ok) {
+        nativeRecStart.current = Date.now();
+        setRecState('recording');
+        setStatus('● recording (fully native: screen + mic + voice chain)');
+        window.screencap.sessionActive(true);
+        return;
+      }
+    }
+    legacyRecord();
   }
 
   async function goLive(url: string, key: string) {

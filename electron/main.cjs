@@ -445,6 +445,77 @@ ipcMain.handle('stream-stop', () => {
   return true;
 });
 
+// ---- Native recording: the throttle-proof pipeline, to disk. Same ddagrab/QSV video +
+// dshow mic + ffmpeg voice chain as native live — recordings survive a minimized window
+// because no Chromium process carries the media. Runs fine alongside a live stream
+// (second QSV session). 'q' on stdin = clean ffmpeg shutdown = intact file.
+const nrec = { proc: null, tmp: null, out: null, stopping: false };
+ipcMain.handle('native-record-start', (e, micDevice, fx) => {
+  const ff = ffmpegPath();
+  if (!ff) return { ok: false, error: 'ffmpeg not found' };
+  if (nrec.proc) return { ok: false, error: 'already recording' };
+  const { spawn } = require('child_process');
+  const dir = recordingsDir();
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  nrec.tmp = path.join(dir, `.live_${stamp}.mkv`);
+  nrec.out = path.join(dir, `ScreenCap_${stamp}.mp4`);
+  nrec.stopping = false;
+  const p = spawn(ff, [
+    '-init_hw_device', 'd3d11va=dx', '-init_hw_device', 'qsv=qs@dx', '-filter_hw_device', 'dx',
+    '-filter_complex', 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]',
+    ...(micDevice
+      ? ['-f', 'dshow', '-audio_buffer_size', '50', '-thread_queue_size', '1024', '-i', `audio=${micDevice}`]
+      : []),
+    '-map', '[v]', ...(micDevice ? ['-map', '0:a'] : []),
+    '-c:v', 'h264_qsv', '-preset', 'fast', '-b:v', '8000k', '-maxrate', '8000k',
+    '-bufsize', '16000k', '-g', '60', '-fps_mode', 'cfr',
+    ...(micDevice ? ['-af', voiceChainFilter(fx), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000'] : []),
+    '-y', nrec.tmp,
+  ]);
+  try { require('os').setPriority(p.pid, require('os').constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
+  p.stdin.on('error', () => {});
+  p.on('error', () => {});
+  const spawnedAt = Date.now();
+  p.on('close', () => {
+    if (nrec.proc !== p) return;
+    nrec.proc = null;
+    // Died on arrival (QSV/dshow failure) without a stop request: tell the renderer to
+    // fall back to the legacy MediaRecorder path.
+    if (!nrec.stopping && Date.now() - spawnedAt < 3_000) {
+      try { fs.unlinkSync(nrec.tmp); } catch {}
+      sendAll('native-record-failed');
+    }
+  });
+  nrec.proc = p;
+  return { ok: true };
+});
+ipcMain.handle('native-record-stop', async () => {
+  const p = nrec.proc;
+  if (!p) return null;
+  nrec.stopping = true;
+  const closed = new Promise((resolve) => p.on('close', resolve));
+  try { p.stdin.write('q'); } catch {}
+  // Verified: a hard-killed mkv remuxes losslessly (q via pipe is unreliable on Windows),
+  // so the backstop is short for a snappy stop.
+  const backstop = setTimeout(() => { try { p.kill(); } catch {} }, 1_500);
+  await closed;
+  clearTimeout(backstop);
+  nrec.proc = null;
+  // Both tracks are already final — pure remux into a real MP4.
+  const ff = ffmpegPath();
+  const ok = await new Promise((resolve) => {
+    const { spawn } = require('child_process');
+    const r = spawn(ff, ['-y', '-i', nrec.tmp, '-c', 'copy', '-movflags', '+faststart', nrec.out]);
+    r.on('close', (c) => resolve(c === 0));
+    r.on('error', () => resolve(false));
+  });
+  if (ok) {
+    try { fs.unlinkSync(nrec.tmp); } catch {}
+    return nrec.out;
+  }
+  return nrec.tmp; // raw kept — footage never lost
+});
+
 // ---- Session keep-awake: while recording/streaming, the OS must not power-throttle us.
 let psbId = null;
 ipcMain.on('session-active', (e, active) => {

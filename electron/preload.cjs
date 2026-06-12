@@ -22,4 +22,7 @@ contextBridge.exposeInMainWorld('screencap', {
   onStreamResume: (cb) => ipcRenderer.on('stream-resume', () => cb()),
   voiceFxAssets: () => ipcRenderer.invoke('voicefx-assets'),
   sessionActive: (on) => ipcRenderer.send('session-active', on),
+  nativeRecordStart: (micDevice, fx) => ipcRenderer.invoke('native-record-start', micDevice, fx),
+  nativeRecordStop: () => ipcRenderer.invoke('native-record-stop'),
+  onNativeRecordFailed: (cb) => ipcRenderer.on('native-record-failed', () => cb()),
 });

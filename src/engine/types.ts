@@ -76,6 +76,9 @@ declare global {
       onStreamResume(cb: () => void): void;
       voiceFxAssets(): Promise<{ rnnoiseWorklet: string; rnnoiseWasm: Uint8Array; error?: string }>;
       sessionActive(on: boolean): void;
+      nativeRecordStart(micDevice: string | null, fx: unknown): Promise<{ ok: boolean; error?: string }>;
+      nativeRecordStop(): Promise<string | null>;
+      onNativeRecordFailed(cb: () => void): void;
     };
   }
 }
