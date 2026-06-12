@@ -12,7 +12,8 @@ contextBridge.exposeInMainWorld('screencap', {
   libraryOpen: (p) => ipcRenderer.invoke('library-open', p),
   libraryOpenFolder: () => ipcRenderer.invoke('library-open-folder'),
   libraryDelete: (p) => ipcRenderer.invoke('library-delete', p),
-  streamStart: (url, key, bitrateK, direct) => ipcRenderer.invoke('stream-start', url, key, bitrateK, direct),
+  streamStart: (url, key, bitrateK, direct, micDevice, fx) =>
+    ipcRenderer.invoke('stream-start', url, key, bitrateK, direct, micDevice, fx),
   streamChunk: (chunk) => ipcRenderer.send('stream-chunk', chunk),
   streamStop: () => ipcRenderer.invoke('stream-stop'),
   onStreamEnded: (cb) => ipcRenderer.on('stream-ended', (e, code, reason) => cb(code, reason)),

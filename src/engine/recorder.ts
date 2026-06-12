@@ -85,11 +85,21 @@ export class Streamer {
     key: string,
     bitrateK: number,
     direct: boolean,
+    micDevice: string | null,
+    fx: unknown,
   ): Promise<string | null> {
-    const res = await window.screencap.streamStart(url, key, bitrateK, direct);
+    const res = await window.screencap.streamStart(url, key, bitrateK, direct, micDevice, fx);
     if (!res.ok) return res.error ?? 'failed';
     this.direct = direct;
-    // Direct mode: ffmpeg captures the screen natively (ddagrab) — only mixer audio is piped.
+    if (direct && micDevice) {
+      // FULLY NATIVE audio: ffmpeg captures the mic itself (DirectShow) and runs the
+      // voice chain in native filters — no MediaRecorder, no pipe, no Chromium in the
+      // live path at all (immune to renderer throttling by construction).
+      this.out = null;
+      this.live = true;
+      return null;
+    }
+    // Pipe modes: direct streams mixer audio only; scene mode streams full A/V.
     this.out = direct
       ? new MediaStream([...audio.getAudioTracks()])
       : new MediaStream([...video.getVideoTracks(), ...audio.getAudioTracks()]);

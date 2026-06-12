@@ -300,22 +300,32 @@ export function App() {
       return;
     }
     setStatus('starting stream…');
-    if (directMode && !sources.some((s) => s.kind === 'screen')) {
-      // Direct mode streams without any studio sources — but then the mixer has nothing
-      // and the stream goes out SILENT (field bug: YouTube reported audio bitrate 0).
-      // Auto-add the primary display AUDIO-ONLY: ffmpeg captures the screen natively,
-      // so a second Chromium 1080p capture would just bleed the renderer/iGPU dry.
+    // FULLY NATIVE audio (panel plan B — the throttling-proof path): when a mic is in
+    // the studio, ffmpeg captures it directly via DirectShow and runs the voice chain
+    // in native filters built from this mic's FX settings. No Chromium in the live path.
+    const mic = directMode ? sources.find((s) => s.kind === 'mic') : undefined;
+    const nativeMic = mic?.label ?? null;
+    if (directMode && !nativeMic && !sources.some((s) => s.kind === 'screen')) {
+      // Pipe-audio fallback only: the mixer must not be empty (field bug: YouTube
+      // reported audio bitrate 0). Add system loopback audio-only.
       const caps = await window.screencap.getCaptureSources();
       const display = caps.find((c) => c.isScreen);
       if (display) await addSource(() => new ScreenSource(mixer.ctx, display.id, 'System audio', true, true));
     }
     // 6800k = YouTube's exact 1080p recommendation; CBR pads to it, so the
     // "bitrate lower than recommended" ingest warning stays silent.
-    const err = await streamer.start(compositor.captureStream(30), mixer.stream, url, key, 6800, directMode);
+    const err = await streamer.start(
+      compositor.captureStream(30), mixer.stream, url, key, 6800, directMode,
+      nativeMic, nativeMic && mic ? chains.get(mic.id)?.settings ?? null : null,
+    );
     if (err) setStatus(`stream failed: ${err}`);
     else {
       setLive(true);
-      setStatus(directMode ? '🔴 connecting… (direct native capture)' : '🔴 connecting…');
+      setStatus(
+        nativeMic
+          ? `🔴 connecting… (FULLY NATIVE: screen + ${nativeMic} + voice chain)`
+          : directMode ? '🔴 connecting… (direct native capture)' : '🔴 connecting…',
+      );
       window.screencap.sessionActive(true);
     }
   }

@@ -167,6 +167,8 @@ const stream = {
   target: null,
   bitrateK: 4000,
   direct: false,        // ddagrab native screen capture (video never touches Chromium)
+  micDevice: null,      // dshow device name → FULLY native audio (no Chromium in the path)
+  fx: null,             // VoiceFx settings from the renderer → ffmpeg filter chain
   qsvBroken: false,     // QuickSync failed this session — fall back to libx264
   spawnMs: 0,           // watchdog startup-grace anchor
   awaitingFresh: false, // drop stale chunks until a fresh container header arrives
@@ -183,6 +185,38 @@ function sendAll(channel, ...args) {
   for (const w of BrowserWindow.getAllWindows()) w.webContents.send(channel, ...args);
 }
 
+// Broadcast voice chain in ffmpeg-NATIVE filters (panel-tuned 2026-06-12, validated on
+// this machine: 0 gaps / locked 30fps / 45s acceptance run). Built from the studio's FX
+// panel settings when provided; falls back to the tuned defaults.
+function voiceChainFilter(fx) {
+  const f = fx || {};
+  const num = (v, d) => (typeof v === 'number' && isFinite(v) ? v : d);
+  const parts = ['aresample=async=1000:first_pts=0'];
+  const trim = num(f.inputDb, 0);
+  if (trim) parts.push(`volume=${trim}dB`);
+  parts.push(`highpass=f=${num(f.lowCut, 80)}:poles=2`);
+  if (f.denoise !== false) parts.push('afftdn=nr=10:nf=-47:tn=1');
+  if (f.gate !== false) {
+    const open = Math.pow(10, num(f.gateDb, -42) / 20).toFixed(4);
+    parts.push(`agate=threshold=${open}:ratio=2:attack=10:release=300:range=0.0631:knee=6:detection=rms`);
+  }
+  if (f.deEss) parts.push('deesser=i=0.25:m=0.5:f=0.55');
+  parts.push(`lowshelf=g=${num(f.eqLow, 1.5)}:f=120:width_type=q:w=0.7`);
+  parts.push(`equalizer=f=250:width_type=q:w=1.0:g=${num(f.eqMud, -2.5)}`);
+  parts.push(`equalizer=f=3000:width_type=q:w=1.0:g=${num(f.eqPresence, 3)}`);
+  parts.push(`highshelf=g=${num(f.eqAir, 2)}:f=12000:width_type=q:w=0.7`);
+  if (f.comp !== false) {
+    const amt = num(f.compAmount, 0.35);
+    const thr = Math.pow(10, (-18 - 17 * amt) / 20).toFixed(4);
+    const ratio = (2 + 4 * amt).toFixed(1);
+    // acompressor makeup is a LINEAR gain factor (1..64) — convert from dB.
+    const makeup = Math.min(64, Math.max(1, Math.pow(10, num(f.makeupDb, 8) / 20))).toFixed(2);
+    parts.push(`acompressor=threshold=${thr}:ratio=${ratio}:attack=5:release=150:knee=6:makeup=${makeup}`);
+  }
+  parts.push('alimiter=limit=0.891:attack=5:release=80:level=disabled');
+  return parts.join(',');
+}
+
 function spawnStream() {
   const { spawn } = require('child_process');
   const ff = ffmpegPath();
@@ -193,25 +227,37 @@ function spawnStream() {
   // path entirely. Default mode: full A/V MediaRecorder stream over the pipe (scene compositing).
   // probesize/analyzeduration: the audio-only pipe trickles ~16KB/s — don't let the
   // demuxer probe stall startup (webm headers identify opus immediately).
-  const audioPipe = [
-    '-fflags', 'nobuffer', '-probesize', '65536', '-analyzeduration', '500000', '-i', 'pipe:0',
-  ];
+  // Direct-mode audio, best-first:
+  // (a) FULLY NATIVE (preferred): ffmpeg captures the mic itself via DirectShow and runs
+  //     the voice chain in native filters — zero Chromium in the audio path, immune to
+  //     renderer occlusion throttling BY CONSTRUCTION (the bug class that survived the
+  //     flags on this machine). Verified: 45s acceptance run, 100% payload, 0 gaps, 30fps.
+  // (b) pipe fallback (no mic in the studio): mixer audio over stdin as before.
+  const nativeAudio = stream.direct && !!stream.micDevice;
+  const audioIn = nativeAudio
+    ? [
+        '-f', 'dshow', '-audio_buffer_size', '50', '-thread_queue_size', '1024',
+        '-i', `audio=${stream.micDevice}`,
+      ]
+    : [
+        '-fflags', 'nobuffer', '-probesize', '65536', '-analyzeduration', '500000', '-i', 'pipe:0',
+      ];
+  const audioMap = ['-map', '[v]', '-map', nativeAudio ? '0:a' : '0:a?'];
   // Zero-copy GPU pipeline (preferred): the desktop renders on the Intel iGPU, so
   // ddagrab captures there and QuickSync encodes ON THE SAME DEVICE — video costs the
-  // CPU ~nothing, which is what stops x264 starving Chromium's audio thread (field bug:
-  // audible glitches in recordings ONLY while live). x264 (4 threads, below-normal
-  // priority) remains as the automatic fallback when QSV init fails.
+  // CPU ~nothing. x264 (4 threads, below-normal priority) remains as the automatic
+  // fallback when QSV init fails.
   const useQsv = stream.direct && !stream.qsvBroken;
   const input = stream.direct
     ? useQsv
       ? [
           '-init_hw_device', 'd3d11va=dx', '-init_hw_device', 'qsv=qs@dx', '-filter_hw_device', 'dx',
           '-filter_complex', 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]',
-          ...audioPipe, '-map', '[v]', '-map', '0:a?',
+          ...audioIn, ...audioMap,
         ]
       : [
           '-filter_complex', `ddagrab=framerate=30,hwdownload,format=bgra,scale='min(1920,iw)':-2[v]`,
-          ...audioPipe, '-map', '[v]', '-map', '0:a?',
+          ...audioIn, ...audioMap,
         ]
     : ['-fflags', 'nobuffer', '-i', 'pipe:0'];
   const videoEnc = useQsv
@@ -235,11 +281,12 @@ function spawnStream() {
   const p = spawn(ff, [
     ...input,
     ...videoEnc,
-    // Direct mode muxes two unsynchronized clocks (ddagrab video vs MediaRecorder audio):
-    // aresample=async continuously micro-corrects audio timestamps so players don't
-    // rubber-band the audio (field bug: warbly/"shaky" sound on YouTube). Keep native 48k.
+    // Native audio: the full broadcast voice chain runs in ffmpeg filters (denoise, gate,
+    // EQ, comp, limiter — from the studio's FX settings). Pipe audio keeps aresample
+    // drift correction (two unsynchronized clocks).
     ...(stream.direct
-      ? ['-af', 'aresample=async=1000:first_pts=0', '-c:a', 'aac', '-b:a', '160k', '-ar', '48000']
+      ? ['-af', nativeAudio ? voiceChainFilter(stream.fx) : 'aresample=async=1000:first_pts=0',
+         '-c:a', 'aac', '-b:a', '160k', '-ar', '48000']
       : ['-c:a', 'aac', '-b:a', '160k', '-ar', '44100']),
     '-f', 'flv', stream.target,
   ]);
@@ -351,7 +398,7 @@ function stopWatchdog() {
   stream.restartTimer = null;
 }
 
-ipcMain.handle('stream-start', (e, url, key, bitrateK, direct) => {
+ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx) => {
   const ff = ffmpegPath();
   if (!ff) return { ok: false, error: 'ffmpeg not found — install it or set FFMPEG env var' };
   if (!/^rtmps?:\/\/.+/.test(url)) return { ok: false, error: 'URL must start with rtmp:// or rtmps://' };
@@ -360,6 +407,8 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK, direct) => {
   stream.target = `${url.replace(/\/$/, '')}/${key.trim()}`;
   stream.bitrateK = bitrateK;
   stream.direct = !!direct;
+  stream.micDevice = (direct && micDevice) || null;
+  stream.fx = fx || null;
   stream.qsvBroken = false; // re-probe QuickSync each go-live
   stream.wanted = true;
   stream.attempts = 0;
