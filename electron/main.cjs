@@ -193,7 +193,12 @@ function spawnStream() {
     '-maxrate', `${stream.bitrateK}k`, '-bufsize', `${stream.bitrateK * 2}k`,
     '-x264-params', 'nal-hrd=cbr',
     '-g', '60', '-keyint_min', '60', '-pix_fmt', 'yuv420p',
-    '-c:a', 'aac', '-b:a', '160k', '-ar', '44100',
+    // Direct mode muxes two unsynchronized clocks (ddagrab video vs MediaRecorder audio):
+    // aresample=async continuously micro-corrects audio timestamps so players don't
+    // rubber-band the audio (field bug: warbly/"shaky" sound on YouTube). Keep native 48k.
+    ...(stream.direct
+      ? ['-af', 'aresample=async=1000:first_pts=0', '-c:a', 'aac', '-b:a', '160k', '-ar', '48000']
+      : ['-c:a', 'aac', '-b:a', '160k', '-ar', '44100']),
     '-f', 'flv', stream.target,
   ]);
   stream.proc = p;

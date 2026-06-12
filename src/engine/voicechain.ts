@@ -86,6 +86,7 @@ export class VoiceChain {
   private gateBuiltAtDb = NaN;
   private wasm: ArrayBuffer | null = null;
   private fx: VoiceFx;
+  private topology = '';
 
   constructor(private ctx: AudioContext, initial?: VoiceFx) {
     this.fx = { ...(initial ?? DEFAULT_FX) };
@@ -142,6 +143,7 @@ export class VoiceChain {
     this.hs.gain.value = hsDb;
     this.makeup.gain.value = Math.pow(10, fx.makeupDb / 20);
     // Gate thresholds are construction-time options — rebuild when the slider moves.
+    let gateRebuilt = false;
     if (fx.gate && this.wasm && this.gateBuiltAtDb !== fx.gateDb) {
       try { this.gateNode?.disconnect(); } catch {}
       this.gateNode = new NoiseGateWorkletNode(this.ctx, {
@@ -151,8 +153,17 @@ export class VoiceChain {
         maxChannels: 2,
       });
       this.gateBuiltAtDb = fx.gateDb;
+      gateRebuilt = true;
     }
-    this.wire();
+    // Only tear down / reconnect the live path when its SHAPE changes — rewiring on
+    // every param tweak (sliders!) interrupts the graph audibly (field bug: "mic stops").
+    const topology = [
+      fx.enabled, fx.denoise && !!this.rnnoise, fx.gate && !!this.gateNode, fx.deEss, fx.comp,
+    ].join(',');
+    if (topology !== this.topology || gateRebuilt) {
+      this.topology = topology;
+      this.wire();
+    }
   }
 
   private wire() {

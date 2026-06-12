@@ -168,8 +168,10 @@ export function App() {
           mixer.attach(s.id, chain.output);
           chains.set(s.id, chain);
           setFxMap((m) => ({ ...m, [s.id]: chain.settings }));
-          // Capture-track AEC default is ON; honor a persisted OFF.
-          if (s instanceof MicSource && !chain.settings.echoCancel) void s.setEchoCancellation(false);
+          // Capture-track AEC default is ON; honor a persisted OFF (re-acquire swaps the node).
+          if (s instanceof MicSource && !chain.settings.echoCancel) {
+            void s.setEchoCancellation(false).then((node) => node?.connect(chain.input));
+          }
         } else {
           mixer.attach(s.id, s.audioNode);
         }
@@ -228,7 +230,11 @@ export function App() {
     chain.apply(next);
     const src = sources.find((s) => s.id === id);
     if (patch.echoCancel !== undefined && src instanceof MicSource) {
-      void src.setEchoCancellation(patch.echoCancel);
+      // Re-acquire swaps the source node — reconnect the fresh one into the chain.
+      void src.setEchoCancellation(patch.echoCancel).then((node) => {
+        const ch = chains.get(id);
+        if (node && ch) node.connect(ch.input);
+      });
     }
     setFxMap((m) => ({ ...m, [id]: next }));
     if (src) localStorage.setItem(`voicefx:${src.label}`, JSON.stringify(next));
@@ -568,10 +574,13 @@ export function App() {
                 <label style={{ cursor: 'pointer' }}>
                   <input type="checkbox" checked={fxMap[s.id].gate} onChange={(e) => updateFx(s.id, { gate: e.target.checked })} /> Gate {fxMap[s.id].gateDb} dB
                 </label>
+                {/* display tracks the drag; the gate worklet rebuild commits on RELEASE —
+                    rebuilding the live audio path per 1dB step caused dropouts */}
                 <input
                   type="range" min="-70" max="-25" step="1" value={fxMap[s.id].gateDb}
                   disabled={!fxMap[s.id].gate}
-                  onChange={(e) => updateFx(s.id, { gateDb: Number(e.target.value) })}
+                  onChange={(e) => setFxMap((m) => ({ ...m, [s.id]: { ...m[s.id], gateDb: Number(e.target.value) } }))}
+                  onPointerUp={(e) => updateFx(s.id, { gateDb: Number((e.target as HTMLInputElement).value) })}
                 />
                 <label>Low cut {fxMap[s.id].lowCut} Hz</label>
                 <input

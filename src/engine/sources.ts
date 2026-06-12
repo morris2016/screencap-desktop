@@ -104,15 +104,25 @@ export class MicSource extends BaseSource {
     this.audioNode = this.audioCtx.createMediaStreamSource(this.stream);
   }
 
-  /** Live AEC flip — no restart; Chromium applies it on the running track. */
-  async setEchoCancellation(on: boolean): Promise<void> {
-    const t = this.stream?.getAudioTracks()[0];
-    if (t) {
-      await t.applyConstraints({
+  /**
+   * AEC flip = clean re-acquire + node swap. applyConstraints on a live track makes
+   * Chromium restart the capture pipeline and can leave the source silent (field bug:
+   * toggling killed the mic until re-added). A fresh stream is deterministic.
+   */
+  async setEchoCancellation(on: boolean): Promise<AudioNode | null> {
+    const fresh = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        deviceId: this.deviceId ? { exact: this.deviceId } : undefined,
         echoCancellation: on,
         noiseSuppression: false,
         autoGainControl: false,
-      });
-    }
+        channelCount: 1,
+      },
+    });
+    this.stream?.getTracks().forEach((t) => t.stop());
+    this.stream = fresh;
+    this.audioNode?.disconnect();
+    this.audioNode = this.audioCtx.createMediaStreamSource(fresh);
+    return this.audioNode;
   }
 }
