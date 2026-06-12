@@ -53,7 +53,11 @@ export function presetBands(p: VoiceFx['preset']): [number, number, number, numb
 
 export const DEFAULT_FX: VoiceFx = {
   inputDb: 0,
-  echoCancel: true,
+  // OFF by default: AEC is an ADAPTIVE filter — it converges over ~seconds and, when its
+  // model is wrong, progressively subtracts live speech (field evidence: VOD clean for the
+  // first seconds of talking, then hard chop slices). Only useful when speakers play sound
+  // the mic can hear; headset users never need it.
+  echoCancel: false,
   denoise: true,
   deepDenoise: true,
   denoiseStrength: 1,
