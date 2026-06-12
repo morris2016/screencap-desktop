@@ -187,6 +187,9 @@ function spawnStream() {
   const p = spawn(ff, [
     ...input,
     '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency',
+    // Half the cores: x264 saturating all 8 starves Chromium's audio thread (wasm
+    // denoisers) — field evidence: recordings glitch ONLY while streaming runs.
+    '-threads', '4',
     // True CBR (nal-hrd padding): ABR undershoots to ~1.6Mbps on static desktops and
     // YouTube flags "bitrate lower than recommended". Steady-rate is the broadcast norm.
     '-b:v', `${stream.bitrateK}k`, '-minrate', `${stream.bitrateK}k`,
@@ -202,6 +205,9 @@ function spawnStream() {
     '-f', 'flv', stream.target,
   ]);
   stream.proc = p;
+  // Below-normal priority: ffmpeg gets all SPARE cpu but never preempts the audio
+  // engine or UI. Combined with -threads this kills the live-session audio glitching.
+  try { require('os').setPriority(p.pid, require('os').constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
   stream.spawnMs = Date.now();
   stream.lastProgressMs = Date.now();
   stream.awaitingFresh = true; // gate stdin until a fresh container header arrives
