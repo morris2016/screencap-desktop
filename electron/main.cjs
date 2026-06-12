@@ -3,6 +3,14 @@ const fs = require('fs');
 const path = require('path');
 const { LinkServer } = require('./linkserver.cjs');
 
+// Chromium's NEW capture backend (Windows Graphics Capture) fails on this class of setup
+// (ProcessFrame E_FAIL floods after display-config changes; field-debugged: frame counter
+// froze while the stream starved). Force the older, battle-tested DXGI duplication capturer.
+app.commandLine.appendSwitch(
+  'disable-features',
+  'AllowWgcScreenCapturer,AllowWgcWindowCapturer,WebRtcAllowWgcDesktopCapturer,WebRtcAllowWgcScreenCapturer,WebRtcAllowWgcWindowCapturer',
+);
+
 const link = new LinkServer();
 
 function createWindow() {
@@ -143,6 +151,7 @@ const stream = {
   wanted: false,        // user intent: stay live until they stop
   target: null,
   bitrateK: 4000,
+  direct: false,        // ddagrab native screen capture (video never touches Chromium)
   attempts: 0,
   lastOkMs: 0,
   lastProgressMs: 0,
@@ -161,8 +170,18 @@ function spawnStream() {
   const ff = ffmpegPath();
   const logPath = path.join(app.getPath('temp'), 'screencap-studio-stream.log');
   let recentErr = [];
+  // Direct mode: video is captured NATIVELY by ffmpeg (Desktop Duplication API via ddagrab)
+  // and only mixer audio rides the pipe — Chromium's flaky WGC capture is out of the video
+  // path entirely. Default mode: full A/V MediaRecorder stream over the pipe (scene compositing).
+  const input = stream.direct
+    ? [
+        '-filter_complex', `ddagrab=framerate=30,hwdownload,format=bgra,scale='min(1920,iw)':-2[v]`,
+        '-fflags', 'nobuffer', '-i', 'pipe:0',
+        '-map', '[v]', '-map', '0:a?',
+      ]
+    : ['-fflags', 'nobuffer', '-i', 'pipe:0'];
   const p = spawn(ff, [
-    '-fflags', 'nobuffer', '-i', 'pipe:0',
+    ...input,
     '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency',
     '-b:v', `${stream.bitrateK}k`, '-maxrate', `${stream.bitrateK}k`,
     '-bufsize', `${stream.bitrateK * 2}k`,
@@ -257,7 +276,7 @@ function stopWatchdog() {
   stream.restartTimer = null;
 }
 
-ipcMain.handle('stream-start', (e, url, key, bitrateK) => {
+ipcMain.handle('stream-start', (e, url, key, bitrateK, direct) => {
   const ff = ffmpegPath();
   if (!ff) return { ok: false, error: 'ffmpeg not found — install it or set FFMPEG env var' };
   if (!/^rtmps?:\/\/.+/.test(url)) return { ok: false, error: 'URL must start with rtmp:// or rtmps://' };
@@ -265,6 +284,7 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK) => {
   if (stream.proc) return { ok: false, error: 'already streaming' };
   stream.target = `${url.replace(/\/$/, '')}/${key.trim()}`;
   stream.bitrateK = bitrateK;
+  stream.direct = !!direct;
   stream.wanted = true;
   stream.attempts = 0;
   stream.lastOkMs = 0;
@@ -282,6 +302,11 @@ ipcMain.handle('stream-stop', () => {
   stopWatchdog();
   if (stream.proc) {
     try { stream.proc.stdin.end(); } catch {}
+    // ddagrab never EOFs — direct mode must be killed, not waited out.
+    if (stream.direct) {
+      const p = stream.proc;
+      setTimeout(() => { try { p.kill(); } catch {} }, 500);
+    }
   }
   return true;
 });

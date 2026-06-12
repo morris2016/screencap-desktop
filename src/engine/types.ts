@@ -60,7 +60,7 @@ declare global {
       libraryOpen(p: string): Promise<void>;
       libraryOpenFolder(): Promise<void>;
       libraryDelete(p: string): Promise<boolean>;
-      streamStart(url: string, key: string, bitrateK: number): Promise<{ ok: boolean; error?: string }>;
+      streamStart(url: string, key: string, bitrateK: number, direct: boolean): Promise<{ ok: boolean; error?: string }>;
       streamChunk(chunk: ArrayBuffer): void;
       streamStop(): Promise<boolean>;
       onStreamEnded(cb: (code: number, reason?: string) => void): void;

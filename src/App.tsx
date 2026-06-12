@@ -41,6 +41,7 @@ export function App() {
   const [monitored, setMonitored] = useState<Record<string, boolean>>({});
   const streamer = useMemo(() => new Streamer(), []);
   const [streamUrl, setStreamUrl] = useState(localStorage.getItem('streamUrl') ?? 'rtmp://a.rtmp.youtube.com/live2');
+  const [directMode, setDirectMode] = useState(localStorage.getItem('directMode') !== '0');
   const [streamKey, setStreamKey] = useState(localStorage.getItem('streamKey') ?? '');
   const [live, setLive] = useState(false);
 
@@ -224,11 +225,11 @@ export function App() {
       return;
     }
     setStatus('starting stream…');
-    const err = await streamer.start(compositor.captureStream(30), mixer.stream, url, key, 4000);
+    const err = await streamer.start(compositor.captureStream(30), mixer.stream, url, key, 4000, directMode);
     if (err) setStatus(`stream failed: ${err}`);
     else {
       setLive(true);
-      setStatus('🔴 connecting…');
+      setStatus(directMode ? '🔴 connecting… (direct native capture)' : '🔴 connecting…');
     }
   }
 
@@ -347,6 +348,17 @@ export function App() {
             value={streamKey}
             onChange={(e) => { setStreamKey(e.target.value); localStorage.setItem('streamKey', e.target.value); }}
           />
+          <label
+            style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, opacity: 0.9, margin: '4px 0 8px', cursor: 'pointer' }}
+            title="Video is captured natively by ffmpeg (Desktop Duplication) — maximum stability, streams your full screen. Untick to stream the composited scenes (phone cam, overlays) instead."
+          >
+            <input
+              type="checkbox"
+              checked={directMode}
+              onChange={(e) => { setDirectMode(e.target.checked); localStorage.setItem('directMode', e.target.checked ? '1' : '0'); }}
+            />
+            🖥️ Direct native capture (most stable — streams full screen, not scenes)
+          </label>
           <button className="add" onClick={testLocal}>🧪 Test stream (local harness)</button>
         </div>
 

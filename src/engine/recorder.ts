@@ -75,12 +75,24 @@ export class Recorder {
 export class Streamer {
   private recorder: MediaRecorder | null = null;
   private out: MediaStream | null = null;
+  private direct = false;
   live = false;
 
-  async start(video: MediaStream, audio: MediaStream, url: string, key: string, bitrateK: number): Promise<string | null> {
-    const res = await window.screencap.streamStart(url, key, bitrateK);
+  async start(
+    video: MediaStream,
+    audio: MediaStream,
+    url: string,
+    key: string,
+    bitrateK: number,
+    direct: boolean,
+  ): Promise<string | null> {
+    const res = await window.screencap.streamStart(url, key, bitrateK, direct);
     if (!res.ok) return res.error ?? 'failed';
-    this.out = new MediaStream([...video.getVideoTracks(), ...audio.getAudioTracks()]);
+    this.direct = direct;
+    // Direct mode: ffmpeg captures the screen natively (ddagrab) — only mixer audio is piped.
+    this.out = direct
+      ? new MediaStream([...audio.getAudioTracks()])
+      : new MediaStream([...video.getVideoTracks(), ...audio.getAudioTracks()]);
     this.beginCapture();
     this.live = true;
     return null;
@@ -97,10 +109,17 @@ export class Streamer {
 
   private beginCapture() {
     if (!this.out) return;
-    const mime = MediaRecorder.isTypeSupported('video/x-matroska;codecs=avc1,opus')
-      ? 'video/x-matroska;codecs=avc1,opus'
-      : 'video/webm;codecs=vp9,opus';
-    this.recorder = new MediaRecorder(this.out, { mimeType: mime, videoBitsPerSecond: 8_000_000 });
+    const mime = this.direct
+      ? 'audio/webm;codecs=opus'
+      : MediaRecorder.isTypeSupported('video/x-matroska;codecs=avc1,opus')
+        ? 'video/x-matroska;codecs=avc1,opus'
+        : 'video/webm;codecs=vp9,opus';
+    this.recorder = new MediaRecorder(
+      this.out,
+      this.direct
+        ? { mimeType: mime, audioBitsPerSecond: 128_000 }
+        : { mimeType: mime, videoBitsPerSecond: 8_000_000 },
+    );
     this.recorder.ondataavailable = async (e) => {
       if (e.data.size) window.screencap.streamChunk(await e.data.arrayBuffer());
     };
