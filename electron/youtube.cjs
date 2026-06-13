@@ -246,10 +246,14 @@ class YouTubeService {
       },
       status: { privacyStatus: privacy || 'unlisted', selfDeclaredMadeForKids: false },
       contentDetails: {
-        enableAutoStart: false,
+        // Auto-start: YouTube flips the broadcast to live the moment it receives the
+        // ingest — no manual transition (which hit "Invalid transition" with the default
+        // monitor/testing phase). Monitor stream off = ready→live directly.
+        enableAutoStart: true,
         enableAutoStop: true,
         enableDvr: true,
         latencyPreference: latency || 'normal', // normal | low | ultraLow
+        monitorStream: { enableMonitorStream: false },
       },
     };
     const j = await this.apiFetch(`${API}/liveBroadcasts?part=snippet,status,contentDetails`, {

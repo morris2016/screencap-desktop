@@ -106,25 +106,24 @@ export function YouTubePanel({ live, startStream, stopStream }: Props) {
     const streamErr = await startStream(s.ingestionAddress, s.streamName);
     if (streamErr) { setErr(streamErr); return setBusy(''); }
 
-    // Wait for YouTube to see the ingest before transitioning to live.
-    setBusy('Waiting for YouTube to receive video…');
-    const active = await waitForActive(s.streamId);
-    if (!active) { setErr('YouTube did not detect the stream — check your connection'); return setBusy(''); }
-
-    setBusy('Going live…');
-    const t = await unwrap(yt().transition(b.id, 'live'), setErr);
+    // enableAutoStart: YouTube flips the broadcast to live as soon as it sees the ingest.
+    // We just poll the broadcast lifecycle until it's actually live, then open chat.
+    setBusy('Waiting for YouTube to go live…');
+    const wentLive = await waitForLive(b.id);
     setBusy('');
-    if (!t) return;
-
+    if (!wentLive) {
+      setErr('Stream is connecting — YouTube has not gone live yet. Leave it running; it can take ~30s.');
+      // keep the encoder running and still open chat; the broadcast will go live shortly
+    }
     yt().chatStart(b.liveChatId);
     setMessages([]);
     setBroadcast({ id: b.id, liveChatId: b.liveChatId, streamId: s.streamId });
   }
 
-  async function waitForActive(streamId: string): Promise<boolean> {
-    for (let i = 0; i < 40; i++) { // ~80s
-      const h = await unwrap(yt().streamHealth(streamId), setErr);
-      if (h === 'active') return true;
+  async function waitForLive(broadcastId: string): Promise<boolean> {
+    for (let i = 0; i < 45; i++) { // ~90s
+      const st = await unwrap(yt().broadcastStatus(broadcastId), setErr);
+      if (st?.lifeCycleStatus === 'live') return true;
       await new Promise((r) => setTimeout(r, 2000));
     }
     return false;
@@ -134,8 +133,10 @@ export function YouTubePanel({ live, startStream, stopStream }: Props) {
     const b = broadcast;
     setBroadcast(null);
     yt().chatStop();
-    if (b) await unwrap(yt().transition(b.id, 'complete'), setErr);
     if (live) stopStream();
+    // enableAutoStop usually completes the broadcast when the encoder stops; this is a
+    // best-effort backstop — ignore "redundant/invalid transition" if already complete.
+    if (b) await yt().transition(b.id, 'complete');
   }
 
   // ---- chat moderation actions ----
