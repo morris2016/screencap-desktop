@@ -312,24 +312,33 @@ export function App() {
       window.screencap.sessionActive(live);
       return;
     }
-    // Native-first (throttle-proof, panel plan B): direct mode + a mic in the studio →
-    // ffmpeg records screen + mic + voice chain itself. Scene mode (or no mic, e.g.
-    // phone-audio setups) keeps the compositor/MediaRecorder path.
-    const mic = sources.find((s) => s.kind === 'mic');
-    if (directMode && mic) {
-      const res = await window.screencap.nativeRecordStart(
-        mic.label, chains.get(mic.id)?.settings ?? null,
-      );
+    // Native-first (throttle-proof): direct mode → ffmpeg records screen + mic + system
+    // audio (all native) itself. Scene mode keeps the compositor/MediaRecorder path.
+    const nat = nativeAudioPlan();
+    if (directMode && (nat.micDevice || nat.audio.system)) {
+      const res = await window.screencap.nativeRecordStart(nat.micDevice, nat.fx, nat.audio);
       if (res.ok) {
         nativeRecStart.current = Date.now();
         setRecState('recording');
-        setStatus('● recording (fully native: screen + mic + voice chain)');
+        setStatus('● recording (fully native: screen + mic + system audio)');
         compositor.setPreviewFps(10); // free the iGPU for ddagrab+QSV
         window.screencap.sessionActive(true);
         return;
       }
     }
     legacyRecord();
+  }
+
+  /** What the native ffmpeg pipeline should capture, from the current studio sources. */
+  function nativeAudioPlan() {
+    const mic = directMode ? sources.find((s) => s.kind === 'mic') : undefined;
+    const micDevice = mic?.label ?? null;
+    // System audio (Discord, music, game) is captured natively (WASAPI loopback) when the
+    // user streams any screen/system source; fallback on so a mic-less direct stream isn't silent.
+    let system = directMode && sources.some((s) => s.kind === 'screen' && !!s.audioNode);
+    if (directMode && !micDevice && !system) system = true;
+    const fx = micDevice && mic ? chains.get(mic.id)?.settings ?? null : null;
+    return { micDevice, fx, audio: { system, sysGainDb: 0 } };
   }
 
   function stopStream() {
@@ -344,24 +353,14 @@ export function App() {
   async function startStream(url: string, key: string): Promise<string | null> {
     if (!key) return 'no stream key';
     setStatus('starting stream…');
-    // FULLY NATIVE audio (panel plan B — the throttling-proof path): when a mic is in
-    // the studio, ffmpeg captures it directly via DirectShow and runs the voice chain
-    // in native filters built from this mic's FX settings. No Chromium in the live path.
-    const mic = directMode ? sources.find((s) => s.kind === 'mic') : undefined;
-    const nativeMic = mic?.label ?? null;
-    if (directMode && !nativeMic && !sources.some((s) => s.kind === 'screen')) {
-      // Pipe-audio fallback only: the mixer must not be empty (field bug: YouTube
-      // reported audio bitrate 0). Add system loopback audio-only.
-      const caps = await window.screencap.getCaptureSources();
-      const display = caps.find((c) => c.isScreen);
-      if (display) await addSource(() => new ScreenSource(mixer.ctx, display.id, 'System audio', true, true));
-    }
-    // 6000k for crisp 1080p — bitrate doesn't affect the capture-bound speed (verified:
-    // 720p, 1080p and 20fps all ~0.96x), so there's no stability reason to starve quality.
-    streamIsNative.current = !!nativeMic;
+    // FULLY NATIVE audio: ffmpeg captures the mic (DirectShow) AND system audio (native
+    // WASAPI loopback, wasaploop.exe) and mixes them in-filter. No Chromium in the live
+    // path → immune to renderer/occlusion throttling (the switch-away breaking).
+    const nat = nativeAudioPlan();
+    streamIsNative.current = directMode && (!!nat.micDevice || nat.audio.system);
     const err = await streamer.start(
       compositor.captureStream(30), mixer.stream, url, key, 6000, directMode,
-      nativeMic, nativeMic && mic ? chains.get(mic.id)?.settings ?? null : null,
+      nat.micDevice, nat.fx, nat.audio,
     );
     if (err) {
       setStatus(`stream failed: ${err}`);
@@ -369,13 +368,13 @@ export function App() {
     }
     setLive(true);
     setStatus(
-      nativeMic
-        ? `🔴 connecting… (FULLY NATIVE: screen + ${nativeMic} + voice chain)`
-        : directMode ? '🔴 connecting… (direct native capture)' : '🔴 connecting…',
+      streamIsNative.current
+        ? `🔴 connecting… (FULLY NATIVE: screen${nat.micDevice ? ' + mic' : ''}${nat.audio.system ? ' + system audio' : ''})`
+        : '🔴 connecting…',
     );
     // Native stream captures the screen itself — throttle the preview canvas so it stops
     // competing with ddagrab+QSV for the iGPU (the cause of the <1.0x audio drops).
-    if (nativeMic) compositor.setPreviewFps(10);
+    if (streamIsNative.current) compositor.setPreviewFps(10);
     window.screencap.sessionActive(true);
     return null;
   }

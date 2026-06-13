@@ -20,6 +20,13 @@
       "electron/**",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "native",
+        "to": "native",
+        "filter": ["wasaploop.exe"]
+      }
+    ],
     "win": {
       "target": "nsis"
     },

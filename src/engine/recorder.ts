@@ -87,14 +87,14 @@ export class Streamer {
     direct: boolean,
     micDevice: string | null,
     fx: unknown,
+    nativeAudio: import('./types').NativeAudioOpts,
   ): Promise<string | null> {
-    const res = await window.screencap.streamStart(url, key, bitrateK, direct, micDevice, fx);
+    const res = await window.screencap.streamStart(url, key, bitrateK, direct, micDevice, fx, nativeAudio);
     if (!res.ok) return res.error ?? 'failed';
     this.direct = direct;
-    if (direct && micDevice) {
-      // FULLY NATIVE audio: ffmpeg captures the mic itself (DirectShow) and runs the
-      // voice chain in native filters — no MediaRecorder, no pipe, no Chromium in the
-      // live path at all (immune to renderer throttling by construction).
+    // Native path whenever ffmpeg can capture the audio itself — a mic and/or system
+    // audio. No MediaRecorder, no pipe, no Chromium in the live path (throttle-immune).
+    if (direct && (micDevice || nativeAudio.system)) {
       this.out = null;
       this.live = true;
       return null;

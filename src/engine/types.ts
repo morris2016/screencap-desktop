@@ -108,6 +108,14 @@ export interface YouTubeBridge {
   onChatMessages(cb: (msgs: YtChatMessage[]) => void): void;
 }
 
+/** Native-audio capture options for the fully-native (ffmpeg) pipeline. */
+export interface NativeAudioOpts {
+  /** Capture system audio (WASAPI loopback) and mix it with the mic. */
+  system: boolean;
+  /** System-audio level trim in dB. */
+  sysGainDb?: number;
+}
+
 declare global {
   interface Window {
     screencap: {
@@ -129,6 +137,7 @@ declare global {
         direct: boolean,
         micDevice: string | null,
         fx: unknown,
+        audio: NativeAudioOpts,
       ): Promise<{ ok: boolean; error?: string }>;
       streamChunk(chunk: ArrayBuffer): void;
       streamStop(): Promise<boolean>;
@@ -139,7 +148,7 @@ declare global {
       voiceFxAssets(): Promise<{ rnnoiseWorklet: string; rnnoiseWasm: Uint8Array; error?: string }>;
       sessionActive(on: boolean): void;
       openExternal(url: string): Promise<void>;
-      nativeRecordStart(micDevice: string | null, fx: unknown): Promise<{ ok: boolean; error?: string }>;
+      nativeRecordStart(micDevice: string | null, fx: unknown, audio: NativeAudioOpts): Promise<{ ok: boolean; error?: string }>;
       nativeRecordStop(): Promise<string | null>;
       onNativeRecordFailed(cb: () => void): void;
       yt: YouTubeBridge;

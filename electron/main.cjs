@@ -169,6 +169,9 @@ const stream = {
   bitrateK: 4000,
   direct: false,        // ddagrab native screen capture (video never touches Chromium)
   micDevice: null,      // dshow device name → FULLY native audio (no Chromium in the path)
+  wantSystem: false,    // also capture system audio (WASAPI loopback) and mix it with the mic
+  sysGainDb: 0,         // system-audio level trim in dB
+  sysProc: null,        // the wasaploop child feeding system audio into ffmpeg stdin
   fx: null,             // VoiceFx settings from the renderer → ffmpeg filter chain
   qsvBroken: false,     // QuickSync failed this session — fall back to libx264
   spawnMs: 0,           // watchdog startup-grace anchor
@@ -189,13 +192,15 @@ function sendAll(channel, ...args) {
 // Broadcast voice chain in ffmpeg-NATIVE filters (panel-tuned 2026-06-12, validated on
 // this machine: 0 gaps / locked 30fps / 45s acceptance run). Built from the studio's FX
 // panel settings when provided; falls back to the tuned defaults.
-function voiceChainFilter(fx) {
+function voiceChainFilter(fx, opts = {}) {
   const f = fx || {};
   const num = (v, d) => (typeof v === 'number' && isFinite(v) ? v : d);
   // Gentle wall-clock sync: async=1 with a 100ms hard-comp floor keeps audio locked to
   // its true capture time and only nudges on large drift — NOT the aggressive async=1000
   // stretch that broke the voice when video ran a few % under realtime (capture-bound).
-  const parts = ['aresample=async=1:min_hard_comp=0.100:first_pts=0'];
+  // opts.limiter=false omits the final limiter (when this chain feeds an amix that limits).
+  const parts = [];
+  if (opts.aresample !== false) parts.push('aresample=async=1:min_hard_comp=0.100:first_pts=0');
   const trim = num(f.inputDb, 0);
   if (trim) parts.push(`volume=${trim}dB`);
   parts.push(`highpass=f=${num(f.lowCut, 80)}:poles=2`);
@@ -217,8 +222,53 @@ function voiceChainFilter(fx) {
     const makeup = Math.min(64, Math.max(1, Math.pow(10, num(f.makeupDb, 8) / 20))).toFixed(2);
     parts.push(`acompressor=threshold=${thr}:ratio=${ratio}:attack=5:release=150:knee=6:makeup=${makeup}`);
   }
-  parts.push('alimiter=limit=0.891:attack=5:release=80:level=disabled');
+  if (opts.limiter !== false) parts.push('alimiter=limit=0.891:attack=5:release=80:level=disabled');
   return parts.join(',');
+}
+
+// Path to the native WASAPI loopback capturer (system audio). Dev: project/native/.
+function wasaplooPath() {
+  const candidates = [
+    path.join(__dirname, '..', 'native', 'wasaploop.exe'),
+    path.join(process.resourcesPath || '', 'native', 'wasaploop.exe'),
+  ];
+  for (const c of candidates) { try { if (fs.existsSync(c)) return c; } catch {} }
+  return null;
+}
+
+/**
+ * Build the native audio half of an ffmpeg capture: dshow mic and/or WASAPI-loopback system
+ * audio, mixed in-filter. Returns { inputs, filterSegs, mapLabel, usePipe }. usePipe=true means
+ * the caller must pipe wasaploop's stdout into ffmpeg's stdin (the system-audio source).
+ */
+function buildNativeAudio({ micDevice, wantSystem, fx, sysGainDb }) {
+  const inputs = [];
+  const segs = [];
+  let n = 0, mi = -1, si = -1;
+  if (micDevice) {
+    inputs.push('-f', 'dshow', '-audio_buffer_size', '80', '-thread_queue_size', '4096', '-rtbufsize', '64M', '-i', `audio=${micDevice}`);
+    mi = n++;
+  }
+  if (wantSystem && wasaplooPath()) {
+    inputs.push('-f', 'f32le', '-ar', '48000', '-ac', '2', '-thread_queue_size', '4096', '-i', 'pipe:0');
+    si = n++;
+  }
+  const sdb = typeof sysGainDb === 'number' ? sysGainDb : 0;
+  const lim = 'alimiter=limit=0.891:attack=5:release=80:level=disabled';
+  let mapLabel = null;
+  if (mi >= 0 && si >= 0) {
+    segs.push(`[${mi}:a]${voiceChainFilter(fx, { limiter: false })}[m]`);
+    segs.push(`[${si}:a]aresample=async=1:first_pts=0,volume=${sdb}dB[s]`);
+    segs.push(`[m][s]amix=inputs=2:duration=longest:normalize=0,${lim}[aout]`);
+    mapLabel = '[aout]';
+  } else if (mi >= 0) {
+    segs.push(`[${mi}:a]${voiceChainFilter(fx)}[aout]`);
+    mapLabel = '[aout]';
+  } else if (si >= 0) {
+    segs.push(`[${si}:a]aresample=async=1:first_pts=0,volume=${sdb}dB,${lim}[aout]`);
+    mapLabel = '[aout]';
+  }
+  return { inputs, filterSegs: segs, mapLabel, usePipe: si >= 0 };
 }
 
 function spawnStream() {
@@ -231,41 +281,32 @@ function spawnStream() {
   // path entirely. Default mode: full A/V MediaRecorder stream over the pipe (scene compositing).
   // probesize/analyzeduration: the audio-only pipe trickles ~16KB/s — don't let the
   // demuxer probe stall startup (webm headers identify opus immediately).
-  // Direct-mode audio, best-first:
-  // (a) FULLY NATIVE (preferred): ffmpeg captures the mic itself via DirectShow and runs
-  //     the voice chain in native filters — zero Chromium in the audio path, immune to
-  //     renderer occlusion throttling BY CONSTRUCTION (the bug class that survived the
-  //     flags on this machine). Verified: 45s acceptance run, 100% payload, 0 gaps, 30fps.
-  // (b) pipe fallback (no mic in the studio): mixer audio over stdin as before.
-  const nativeAudio = stream.direct && !!stream.micDevice;
-  const audioIn = nativeAudio
-    ? [
-        // rtbufsize cushions the live mic against transient sub-realtime spikes so dshow
-        // doesn't drop audio frames (the "buffer too full" shaky-voice symptom).
-        '-f', 'dshow', '-audio_buffer_size', '80', '-thread_queue_size', '4096',
-        '-rtbufsize', '64M', '-i', `audio=${stream.micDevice}`,
-      ]
-    : [
-        '-fflags', 'nobuffer', '-probesize', '65536', '-analyzeduration', '500000', '-i', 'pipe:0',
-      ];
-  const audioMap = ['-map', '[v]', '-map', nativeAudio ? '0:a' : '0:a?'];
-  // Zero-copy GPU pipeline (preferred): the desktop renders on the Intel iGPU, so
-  // ddagrab captures there and QuickSync encodes ON THE SAME DEVICE — video costs the
-  // CPU ~nothing. x264 (4 threads, below-normal priority) remains as the automatic
-  // fallback when QSV init fails.
+  // FULLY NATIVE A/V (direct mode): ffmpeg captures the screen (ddagrab), the mic (dshow),
+  // AND system audio (WASAPI loopback via wasaploop on stdin), mixing mic+system in-filter.
+  // Zero Chromium in the path — immune to renderer/occlusion throttling by construction.
+  // Non-direct: full A/V MediaRecorder webm over the pipe (scene compositing).
   const useQsv = stream.direct && !stream.qsvBroken;
-  const input = stream.direct
-    ? useQsv
-      ? [
-          '-init_hw_device', 'd3d11va=dx', '-init_hw_device', 'qsv=qs@dx', '-filter_hw_device', 'dx',
-          '-filter_complex', 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]',
-          ...audioIn, ...audioMap,
-        ]
-      : [
-          '-filter_complex', `ddagrab=framerate=30,hwdownload,format=bgra,scale='min(1920,iw)':-2[v]`,
-          ...audioIn, ...audioMap,
-        ]
-    : ['-fflags', 'nobuffer', '-i', 'pipe:0'];
+  let input, audioOut, useSysPipe = false;
+  if (stream.direct) {
+    const na = buildNativeAudio({
+      micDevice: stream.micDevice,
+      wantSystem: stream.wantSystem,
+      fx: stream.fx,
+      sysGainDb: stream.sysGainDb,
+    });
+    useSysPipe = na.usePipe;
+    const vfilter = useQsv
+      ? 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]'
+      : `ddagrab=framerate=30,hwdownload,format=bgra,scale='min(1920,iw)':-2[v]`;
+    const hw = useQsv ? ['-init_hw_device', 'd3d11va=dx', '-init_hw_device', 'qsv=qs@dx', '-filter_hw_device', 'dx'] : [];
+    const fc = [vfilter, ...na.filterSegs].join(';');
+    input = [...hw, ...na.inputs, '-filter_complex', fc, '-map', '[v]'];
+    if (na.mapLabel) input.push('-map', na.mapLabel);
+    audioOut = na.mapLabel ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000'] : [];
+  } else {
+    input = ['-fflags', 'nobuffer', '-i', 'pipe:0'];
+    audioOut = ['-af', 'aresample=async=1000:first_pts=0', '-c:a', 'aac', '-b:a', '160k', '-ar', '44100'];
+  }
   const videoEnc = useQsv
     ? [
         '-c:v', 'h264_qsv', '-preset', 'veryfast',
@@ -290,17 +331,23 @@ function spawnStream() {
   const p = spawn(ff, [
     ...input,
     ...videoEnc,
-    // Native audio: the full broadcast voice chain runs in ffmpeg filters (denoise, gate,
-    // EQ, comp, limiter — from the studio's FX settings). Pipe audio keeps aresample
-    // drift correction (two unsynchronized clocks).
-    ...(stream.direct
-      ? ['-af', nativeAudio ? voiceChainFilter(stream.fx) : 'aresample=async=1000:first_pts=0',
-         '-c:a', 'aac', '-b:a', '160k', '-ar', '48000']
-      : ['-c:a', 'aac', '-b:a', '160k', '-ar', '44100']),
+    ...audioOut,
     '-f', 'flv', stream.target,
   ]);
   p.usedQsv = useQsv;
   stream.proc = p;
+  // System audio: pipe the native WASAPI loopback capturer into ffmpeg's stdin.
+  stopSysAudio();
+  if (useSysPipe) {
+    const wp = wasaplooPath();
+    if (wp) {
+      const sysProc = spawn(wp, [], { stdio: ['ignore', 'pipe', 'ignore'] });
+      sysProc.on('error', () => {});
+      sysProc.stdout.on('error', () => {});
+      try { sysProc.stdout.pipe(p.stdin); } catch {}
+      stream.sysProc = sysProc;
+    }
+  }
   // Priority by mode. NATIVE mode: ffmpeg IS the capture+encode+audio, so it must run
   // HIGH — otherwise Windows background-throttles our process the instant the app loses
   // foreground, the ddagrab grab collapses to ~0.5x, and the audio shreds (field bug:
@@ -416,7 +463,14 @@ function stopWatchdog() {
   stream.restartTimer = null;
 }
 
-ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx) => {
+function stopSysAudio() {
+  if (stream.sysProc) {
+    try { stream.sysProc.kill(); } catch {}
+    stream.sysProc = null;
+  }
+}
+
+ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx, audio) => {
   const ff = ffmpegPath();
   if (!ff) return { ok: false, error: 'ffmpeg not found — install it or set FFMPEG env var' };
   if (!/^rtmps?:\/\/.+/.test(url)) return { ok: false, error: 'URL must start with rtmp:// or rtmps://' };
@@ -427,6 +481,8 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx) =>
   stream.direct = !!direct;
   stream.micDevice = (direct && micDevice) || null;
   stream.fx = fx || null;
+  stream.wantSystem = !!(direct && audio && audio.system);
+  stream.sysGainDb = (audio && typeof audio.sysGainDb === 'number') ? audio.sysGainDb : 0;
   stream.qsvBroken = false; // re-probe QuickSync each go-live
   stream.wanted = true;
   stream.attempts = 0;
@@ -452,6 +508,7 @@ ipcMain.on('stream-chunk', (e, chunk) => {
 ipcMain.handle('stream-stop', () => {
   stream.wanted = false;
   stopWatchdog();
+  stopSysAudio();
   if (stream.proc) {
     try { stream.proc.stdin.end(); } catch {}
     // ddagrab never EOFs — direct mode must be killed, not waited out.
@@ -467,8 +524,8 @@ ipcMain.handle('stream-stop', () => {
 // dshow mic + ffmpeg voice chain as native live — recordings survive a minimized window
 // because no Chromium process carries the media. Runs fine alongside a live stream
 // (second QSV session). 'q' on stdin = clean ffmpeg shutdown = intact file.
-const nrec = { proc: null, tmp: null, out: null, stopping: false };
-ipcMain.handle('native-record-start', (e, micDevice, fx) => {
+const nrec = { proc: null, tmp: null, out: null, stopping: false, sysProc: null };
+ipcMain.handle('native-record-start', (e, micDevice, fx, audio) => {
   const ff = ffmpegPath();
   if (!ff) return { ok: false, error: 'ffmpeg not found' };
   if (nrec.proc) return { ok: false, error: 'already recording' };
@@ -478,16 +535,21 @@ ipcMain.handle('native-record-start', (e, micDevice, fx) => {
   nrec.tmp = path.join(dir, `.live_${stamp}.mkv`);
   nrec.out = path.join(dir, `ScreenCap_${stamp}.mp4`);
   nrec.stopping = false;
+  const na = buildNativeAudio({
+    micDevice,
+    wantSystem: !!(audio && audio.system),
+    fx,
+    sysGainDb: (audio && typeof audio.sysGainDb === 'number') ? audio.sysGainDb : 0,
+  });
+  const fc = ['ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]', ...na.filterSegs].join(';');
   const p = spawn(ff, [
     '-init_hw_device', 'd3d11va=dx', '-init_hw_device', 'qsv=qs@dx', '-filter_hw_device', 'dx',
-    '-filter_complex', 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]',
-    ...(micDevice
-      ? ['-f', 'dshow', '-audio_buffer_size', '80', '-thread_queue_size', '4096', '-rtbufsize', '64M', '-i', `audio=${micDevice}`]
-      : []),
-    '-map', '[v]', ...(micDevice ? ['-map', '0:a'] : []),
+    ...na.inputs,
+    '-filter_complex', fc,
+    '-map', '[v]', ...(na.mapLabel ? ['-map', na.mapLabel] : []),
     '-c:v', 'h264_qsv', '-preset', 'fast', '-b:v', '8000k', '-maxrate', '8000k',
     '-bufsize', '16000k', '-g', '60', '-fps_mode', 'passthrough',
-    ...(micDevice ? ['-af', voiceChainFilter(fx), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000'] : []),
+    ...(na.mapLabel ? ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000'] : []),
     '-y', nrec.tmp,
   ]);
   // HIGH priority: native recorder must survive the app being backgrounded (same
@@ -495,6 +557,18 @@ ipcMain.handle('native-record-start', (e, micDevice, fx) => {
   try { require('os').setPriority(p.pid, require('os').constants.priority.PRIORITY_HIGH); } catch {}
   p.stdin.on('error', () => {});
   p.on('error', () => {});
+  // System audio: pipe the native WASAPI loopback capturer into ffmpeg's stdin.
+  if (nrec.sysProc) { try { nrec.sysProc.kill(); } catch {} nrec.sysProc = null; }
+  if (na.usePipe) {
+    const wp = wasaplooPath();
+    if (wp) {
+      const sysProc = spawn(wp, [], { stdio: ['ignore', 'pipe', 'ignore'] });
+      sysProc.on('error', () => {});
+      sysProc.stdout.on('error', () => {});
+      try { sysProc.stdout.pipe(p.stdin); } catch {}
+      nrec.sysProc = sysProc;
+    }
+  }
   const spawnedAt = Date.now();
   p.on('close', () => {
     if (nrec.proc !== p) return;
@@ -507,17 +581,20 @@ ipcMain.handle('native-record-start', (e, micDevice, fx) => {
     }
   });
   nrec.proc = p;
+  nrec.usePipe = na.usePipe;
   return { ok: true };
 });
 ipcMain.handle('native-record-stop', async () => {
   const p = nrec.proc;
   if (!p) return null;
   nrec.stopping = true;
+  // Stop system audio first so it stops feeding stdin, then stop ffmpeg.
+  if (nrec.sysProc) { try { nrec.sysProc.kill(); } catch {} nrec.sysProc = null; }
   const closed = new Promise((resolve) => p.on('close', resolve));
-  try { p.stdin.write('q'); } catch {}
-  // Verified: a hard-killed mkv remuxes losslessly (q via pipe is unreliable on Windows),
-  // so the backstop is short for a snappy stop.
-  const backstop = setTimeout(() => { try { p.kill(); } catch {} }, 1_500);
+  // When stdin carries system-audio PCM we can't send 'q' there — kill (mkv remuxes
+  // losslessly, verified). Without system audio, 'q' for a clean shutdown, kill as backstop.
+  if (!nrec.usePipe) { try { p.stdin.write('q'); } catch {} }
+  const backstop = setTimeout(() => { try { p.kill(); } catch {} }, nrec.usePipe ? 300 : 1_500);
   await closed;
   clearTimeout(backstop);
   nrec.proc = null;

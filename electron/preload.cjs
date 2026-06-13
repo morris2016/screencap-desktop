@@ -12,8 +12,8 @@ contextBridge.exposeInMainWorld('screencap', {
   libraryOpen: (p) => ipcRenderer.invoke('library-open', p),
   libraryOpenFolder: () => ipcRenderer.invoke('library-open-folder'),
   libraryDelete: (p) => ipcRenderer.invoke('library-delete', p),
-  streamStart: (url, key, bitrateK, direct, micDevice, fx) =>
-    ipcRenderer.invoke('stream-start', url, key, bitrateK, direct, micDevice, fx),
+  streamStart: (url, key, bitrateK, direct, micDevice, fx, audio) =>
+    ipcRenderer.invoke('stream-start', url, key, bitrateK, direct, micDevice, fx, audio),
   streamChunk: (chunk) => ipcRenderer.send('stream-chunk', chunk),
   streamStop: () => ipcRenderer.invoke('stream-stop'),
   onStreamEnded: (cb) => ipcRenderer.on('stream-ended', (e, code, reason) => cb(code, reason)),
@@ -23,7 +23,7 @@ contextBridge.exposeInMainWorld('screencap', {
   voiceFxAssets: () => ipcRenderer.invoke('voicefx-assets'),
   sessionActive: (on) => ipcRenderer.send('session-active', on),
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
-  nativeRecordStart: (micDevice, fx) => ipcRenderer.invoke('native-record-start', micDevice, fx),
+  nativeRecordStart: (micDevice, fx, audio) => ipcRenderer.invoke('native-record-start', micDevice, fx, audio),
   nativeRecordStop: () => ipcRenderer.invoke('native-record-stop'),
   onNativeRecordFailed: (cb) => ipcRenderer.on('native-record-failed', () => cb()),
   yt: {
