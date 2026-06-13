@@ -47,10 +47,23 @@ export function App() {
   const streamer = useMemo(() => new Streamer(), []);
   // Internal-audio source: '' = all system audio; otherwise a process NAME (PID is resolved
   // live at go-live, since PIDs change between runs). Keeps Discord clean & mic separate.
-  const [internalAppName, setInternalAppName] = useState(localStorage.getItem('internalApp') ?? '');
+  // Internal audio: a SET of app names to capture (multi-select); [] = all system audio.
+  const [internalAppNames, setInternalAppNames] = useState<string[]>(
+    JSON.parse(localStorage.getItem('internalApps') ?? '[]'),
+  );
   const [audioApps, setAudioApps] = useState<AudioApp[]>([]);
   const refreshAudioApps = () => window.screencap.listAudioApps().then(setAudioApps);
   useEffect(() => { void refreshAudioApps(); }, []);
+  function toggleInternalApp(name: string) {
+    setInternalAppNames((cur) => {
+      const next = cur.includes(name) ? cur.filter((n) => n !== name) : [...cur, name];
+      localStorage.setItem('internalApps', JSON.stringify(next));
+      return next;
+    });
+  }
+  // Independent operator-controlled levels for the native mix (Discord never auto-ducks).
+  const [sysGainDb, setSysGainDb] = useState(Number(localStorage.getItem('sysGainDb') ?? '0'));
+  const [micGainDb, setMicGainDb] = useState(Number(localStorage.getItem('micGainDb') ?? '0'));
   const [streamUrl, setStreamUrl] = useState(localStorage.getItem('streamUrl') ?? 'rtmp://a.rtmp.youtube.com/live2');
   // Native capture is the ONLY streaming engine now — ffmpeg captures screen + mic + system
   // audio directly (no Chromium in the media path). The old MediaRecorder pipe path and its
@@ -347,15 +360,17 @@ export function App() {
     // user streams any screen/system source; fallback on so a mic-less direct stream isn't silent.
     let system = directMode && sources.some((s) => s.kind === 'screen' && !!s.audioNode);
     if (directMode && !micDevice && !system) system = true;
-    // Per-app internal audio: resolve the chosen process name → its CURRENT pid so only that
-    // app's sound is captured (clean Discord), kept separate from the mic. '' = all system.
-    let systemPid = 0;
-    if (system && internalAppName) {
+    // Per-app internal audio: resolve the chosen process names → their CURRENT pids so only
+    // those apps' sound is captured, kept separate from the mic. [] = all system audio.
+    let systemPids: number[] = [];
+    if (system && internalAppNames.length) {
       const apps = await window.screencap.listAudioApps();
-      systemPid = apps.find((a) => a.name === internalAppName)?.pid ?? 0;
+      systemPids = internalAppNames
+        .map((n) => apps.find((a) => a.name === n)?.pid)
+        .filter((p): p is number => typeof p === 'number' && p > 0);
     }
     const fx = micDevice && mic ? chains.get(mic.id)?.settings ?? null : null;
-    return { micDevice, fx, audio: { system, systemPid, sysGainDb: 0 } };
+    return { micDevice, fx, audio: { system, systemPids, sysGainDb, micGainDb } };
   }
 
   function stopStream() {
@@ -510,26 +525,39 @@ export function App() {
           ))}
 
           <div style={{ marginTop: 14 }}>
-            <h2 style={{ margin: '0 0 6px' }}>🔊 Internal audio</h2>
-            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-              <select
-                className="add" style={{ flex: 1, marginBottom: 0 }}
-                value={internalAppName}
-                onMouseDown={refreshAudioApps}
-                onChange={(e) => { setInternalAppName(e.target.value); localStorage.setItem('internalApp', e.target.value); }}
-              >
-                <option value="">All system audio</option>
-                {audioApps.map((a) => (
-                  <option key={a.name} value={a.name}>{a.name}{a.title ? ` — ${a.title.slice(0, 32)}` : ''}</option>
-                ))}
-              </select>
-              <button className="add" style={{ width: 36, marginBottom: 0 }} title="Refresh app list" onClick={refreshAudioApps}>🔄</button>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h2 style={{ margin: '0 0 6px' }}>🔊 Internal audio</h2>
+              <a style={{ cursor: 'pointer', color: 'var(--dim)', fontSize: 12 }} onClick={refreshAudioApps}>🔄 refresh</a>
+            </div>
+            <div style={{ maxHeight: 150, overflowY: 'auto', border: '1px solid #2a2a35', borderRadius: 8, padding: 6 }}>
+              <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, cursor: 'pointer', padding: '2px 0' }}>
+                <input type="checkbox" checked={internalAppNames.length === 0}
+                  onChange={() => { setInternalAppNames([]); localStorage.setItem('internalApps', '[]'); }} />
+                <b>All system audio</b>
+              </label>
+              {audioApps.map((a) => (
+                <label key={a.name} style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, cursor: 'pointer', padding: '2px 0' }}>
+                  <input type="checkbox" checked={internalAppNames.includes(a.name)} onChange={() => toggleInternalApp(a.name)} />
+                  <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {a.name}{a.title ? ` — ${a.title.slice(0, 28)}` : ''}
+                  </span>
+                </label>
+              ))}
             </div>
             <small style={{ color: 'var(--dim)' }}>
-              {internalAppName
-                ? `Streaming only ${internalAppName}'s audio — captured cleanly, separate from your mic.`
-                : 'Capturing all system audio. Pick an app (e.g. Discord) to stream only its sound.'}
+              {internalAppNames.length
+                ? `Streaming only: ${internalAppNames.join(', ')} — each captured cleanly, separate from your mic.`
+                : 'Capturing all system audio. Tick apps (e.g. Discord) to stream only their sound.'}
             </small>
+            <div style={{ display: 'grid', gap: 2, marginTop: 8, fontSize: 12 }}>
+              <label>🔊 Internal volume · {sysGainDb > 0 ? '+' : ''}{sysGainDb} dB</label>
+              <input type="range" min="-30" max="12" step="1" value={sysGainDb}
+                onChange={(e) => { const v = Number(e.target.value); setSysGainDb(v); localStorage.setItem('sysGainDb', String(v)); }} />
+              <label>🎙 Mic volume · {micGainDb > 0 ? '+' : ''}{micGainDb} dB</label>
+              <input type="range" min="-30" max="12" step="1" value={micGainDb}
+                onChange={(e) => { const v = Number(e.target.value); setMicGainDb(v); localStorage.setItem('micGainDb', String(v)); }} />
+              <small style={{ color: 'var(--dim)' }}>Independent levels — internal audio is never auto-ducked by the mic.</small>
+            </div>
           </div>
 
           <div style={{ marginTop: 14 }}>

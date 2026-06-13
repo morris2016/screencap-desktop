@@ -196,9 +196,10 @@ const stream = {
   direct: false,        // ddagrab native screen capture (video never touches Chromium)
   micDevice: null,      // dshow device name → FULLY native audio (no Chromium in the path)
   wantSystem: false,    // also capture system audio (WASAPI loopback) and mix it with the mic
-  systemPid: 0,         // capture ONLY this process tree's audio (per-app); 0 = all system
-  sysGainDb: 0,         // system-audio level trim in dB
-  sysProc: null,        // the wasaploop child feeding system audio into ffmpeg stdin
+  systemPids: [],       // capture ONLY these process trees' audio (per-app, multi); [] = all system
+  sysGainDb: 0,         // system-audio level trim in dB (operator-controlled)
+  micGainDb: 0,         // mic level trim in dB (operator-controlled, post voice chain)
+  sysProcs: [],         // the wasaploop children feeding system audio into ffmpeg stdin
   fx: null,             // VoiceFx settings from the renderer → ffmpeg filter chain
   qsvBroken: false,     // QuickSync failed this session — fall back to libx264
   spawnMs: 0,           // watchdog startup-grace anchor
@@ -253,6 +254,55 @@ function voiceChainFilter(fx, opts = {}) {
   return parts.join(',');
 }
 
+// Spawn the WASAPI loopback capturer(s) and feed ffmpeg's stdin. With multiple selected apps,
+// run one wasaploop per app and mix their f32le streams frame-aligned in Node, so ffmpeg still
+// reads a single internal-audio input. pids=[] → one capturer of ALL system audio.
+function spawnSysAudio(pids, ffStdin) {
+  const { spawn } = require('child_process');
+  const wp = wasaplooPath();
+  if (!wp) return [];
+  const list = pids && pids.length ? pids : [0]; // 0 = all system audio
+  const procs = list.map((pid) => {
+    const p = spawn(wp, pid ? [String(pid)] : [], { stdio: ['ignore', 'pipe', 'ignore'] });
+    p.on('error', () => {});
+    p.stdout.on('error', () => {});
+    return p;
+  });
+  if (procs.length === 1) {
+    try { procs[0].stdout.pipe(ffStdin); } catch {}
+  } else {
+    mixPcmStreams(procs.map((p) => p.stdout), ffStdin);
+  }
+  return procs;
+}
+
+// Sum N f32le/48k/stereo streams sample-by-sample into one. All capturers share the render
+// clock and emit silence-as-zeros continuously, so the streams stay frame-aligned; the slowest
+// gates output. No clamp — downstream ffmpeg volume + limiter manage headroom.
+function mixPcmStreams(streams, out) {
+  const state = streams.map(() => ({ buf: Buffer.alloc(0), alive: true }));
+  const drain = () => {
+    const live = state.filter((s) => s.alive);
+    if (!live.length) return;
+    let min = Math.min(...live.map((s) => s.buf.length));
+    min -= min % 4;
+    if (min <= 0) return;
+    const mixed = Buffer.alloc(min);
+    for (let off = 0; off < min; off += 4) {
+      let sum = 0;
+      for (const s of live) sum += s.buf.readFloatLE(off);
+      mixed.writeFloatLE(sum, off);
+    }
+    for (const s of live) s.buf = s.buf.subarray(min);
+    try { out.write(mixed); } catch {}
+  };
+  streams.forEach((s, i) => {
+    s.on('data', (d) => { state[i].buf = Buffer.concat([state[i].buf, d]); drain(); });
+    const drop = () => { state[i].alive = false; state[i].buf = Buffer.alloc(0); drain(); };
+    s.on('error', drop); s.on('end', drop); s.on('close', drop);
+  });
+}
+
 // Path to the native WASAPI loopback capturer (system audio). Dev: project/native/.
 function wasaplooPath() {
   const candidates = [
@@ -268,7 +318,7 @@ function wasaplooPath() {
  * audio, mixed in-filter. Returns { inputs, filterSegs, mapLabel, usePipe }. usePipe=true means
  * the caller must pipe wasaploop's stdout into ffmpeg's stdin (the system-audio source).
  */
-function buildNativeAudio({ micDevice, wantSystem, fx, sysGainDb }) {
+function buildNativeAudio({ micDevice, wantSystem, fx, sysGainDb, micGainDb }) {
   const inputs = [];
   const segs = [];
   let n = 0, mi = -1, si = -1;
@@ -281,12 +331,17 @@ function buildNativeAudio({ micDevice, wantSystem, fx, sysGainDb }) {
     si = n++;
   }
   const sdb = typeof sysGainDb === 'number' ? sysGainDb : 0;
+  const mdb = typeof micGainDb === 'number' ? micGainDb : 0;
   const lim = 'alimiter=limit=0.891:attack=5:release=80:level=disabled';
   let mapLabel = null;
   if (mi >= 0 && si >= 0) {
-    segs.push(`[${mi}:a]${voiceChainFilter(fx, { limiter: false })}[m]`);
+    // Mic and system audio are summed at INDEPENDENT, user-set levels. Discord is NEVER
+    // auto-reduced/ducked by the mic — the operator controls its volume with the fader.
+    // The final limiter is a transparent clip-guard only (catches true >0dBFS peaks so the
+    // mix can't distort; otherwise inaudible, so it doesn't pull the system audio down).
+    segs.push(`[${mi}:a]${voiceChainFilter(fx, { limiter: false })},volume=${mdb}dB[m]`);
     segs.push(`[${si}:a]aresample=async=1:first_pts=0,volume=${sdb}dB[s]`);
-    segs.push(`[m][s]amix=inputs=2:duration=longest:normalize=0,${lim}[aout]`);
+    segs.push(`[m][s]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.99:attack=3:release=50:level=disabled[aout]`);
     mapLabel = '[aout]';
   } else if (mi >= 0) {
     segs.push(`[${mi}:a]${voiceChainFilter(fx)}[aout]`);
@@ -320,6 +375,7 @@ function spawnStream() {
       wantSystem: stream.wantSystem,
       fx: stream.fx,
       sysGainDb: stream.sysGainDb,
+      micGainDb: stream.micGainDb,
     });
     useSysPipe = na.usePipe;
     // Downscale to 1080p (keep aspect): a 1440p/4K desktop captured natively makes YouTube
@@ -372,16 +428,8 @@ function spawnStream() {
   // System audio: pipe the native WASAPI loopback capturer into ffmpeg's stdin.
   stopSysAudio();
   if (useSysPipe) {
-    const wp = wasaplooPath();
-    if (wp) {
-      // PID arg = capture ONLY that app's audio (clean Discord); none = all system audio.
-      const args = stream.systemPid ? [String(stream.systemPid)] : [];
-      const sysProc = spawn(wp, args, { stdio: ['ignore', 'pipe', 'ignore'] });
-      sysProc.on('error', () => {});
-      sysProc.stdout.on('error', () => {});
-      try { sysProc.stdout.pipe(p.stdin); } catch {}
-      stream.sysProc = sysProc;
-    }
+    // One capturer per selected app (clean, per-app), mixed in Node → ffmpeg stdin; [] = all.
+    stream.sysProcs = spawnSysAudio(stream.systemPids, p.stdin);
   }
   // Priority by mode. NATIVE mode: ffmpeg IS the capture+encode+audio, so it must run
   // HIGH — otherwise Windows background-throttles our process the instant the app loses
@@ -499,10 +547,8 @@ function stopWatchdog() {
 }
 
 function stopSysAudio() {
-  if (stream.sysProc) {
-    try { stream.sysProc.kill(); } catch {}
-    stream.sysProc = null;
-  }
+  for (const p of stream.sysProcs) { try { p.kill(); } catch {} }
+  stream.sysProcs = [];
 }
 
 ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx, audio) => {
@@ -517,8 +563,9 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx, au
   stream.micDevice = (direct && micDevice) || null;
   stream.fx = fx || null;
   stream.wantSystem = !!(direct && audio && audio.system);
-  stream.systemPid = (audio && Number(audio.systemPid)) || 0;
+  stream.systemPids = (audio && Array.isArray(audio.systemPids)) ? audio.systemPids.map(Number).filter(Boolean) : [];
   stream.sysGainDb = (audio && typeof audio.sysGainDb === 'number') ? audio.sysGainDb : 0;
+  stream.micGainDb = (audio && typeof audio.micGainDb === 'number') ? audio.micGainDb : 0;
   stream.qsvBroken = false; // re-probe QuickSync each go-live
   stream.wanted = true;
   stream.attempts = 0;
@@ -560,7 +607,7 @@ ipcMain.handle('stream-stop', () => {
 // dshow mic + ffmpeg voice chain as native live — recordings survive a minimized window
 // because no Chromium process carries the media. Runs fine alongside a live stream
 // (second QSV session). 'q' on stdin = clean ffmpeg shutdown = intact file.
-const nrec = { proc: null, tmp: null, out: null, stopping: false, sysProc: null };
+const nrec = { proc: null, tmp: null, out: null, stopping: false, sysProcs: [] };
 ipcMain.handle('native-record-start', (e, micDevice, fx, audio) => {
   const ff = ffmpegPath();
   if (!ff) return { ok: false, error: 'ffmpeg not found' };
@@ -576,6 +623,7 @@ ipcMain.handle('native-record-start', (e, micDevice, fx, audio) => {
     wantSystem: !!(audio && audio.system),
     fx,
     sysGainDb: (audio && typeof audio.sysGainDb === 'number') ? audio.sysGainDb : 0,
+    micGainDb: (audio && typeof audio.micGainDb === 'number') ? audio.micGainDb : 0,
   });
   const fc = ['ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]', ...na.filterSegs].join(';');
   const p = spawn(ff, [
@@ -593,18 +641,12 @@ ipcMain.handle('native-record-start', (e, micDevice, fx, audio) => {
   try { require('os').setPriority(p.pid, require('os').constants.priority.PRIORITY_HIGH); } catch {}
   p.stdin.on('error', () => {});
   p.on('error', () => {});
-  // System audio: pipe the native WASAPI loopback capturer into ffmpeg's stdin.
-  if (nrec.sysProc) { try { nrec.sysProc.kill(); } catch {} nrec.sysProc = null; }
+  // System audio: one capturer per selected app, mixed in Node → ffmpeg's stdin.
+  for (const sp of nrec.sysProcs || []) { try { sp.kill(); } catch {} }
+  nrec.sysProcs = [];
   if (na.usePipe) {
-    const wp = wasaplooPath();
-    if (wp) {
-      const sysPid = (audio && Number(audio.systemPid)) || 0;
-      const sysProc = spawn(wp, sysPid ? [String(sysPid)] : [], { stdio: ['ignore', 'pipe', 'ignore'] });
-      sysProc.on('error', () => {});
-      sysProc.stdout.on('error', () => {});
-      try { sysProc.stdout.pipe(p.stdin); } catch {}
-      nrec.sysProc = sysProc;
-    }
+    const pids = (audio && Array.isArray(audio.systemPids)) ? audio.systemPids.map(Number).filter(Boolean) : [];
+    nrec.sysProcs = spawnSysAudio(pids, p.stdin);
   }
   const spawnedAt = Date.now();
   p.on('close', () => {
@@ -626,7 +668,8 @@ ipcMain.handle('native-record-stop', async () => {
   if (!p) return null;
   nrec.stopping = true;
   // Stop system audio first so it stops feeding stdin, then stop ffmpeg.
-  if (nrec.sysProc) { try { nrec.sysProc.kill(); } catch {} nrec.sysProc = null; }
+  for (const sp of nrec.sysProcs || []) { try { sp.kill(); } catch {} }
+  nrec.sysProcs = [];
   const closed = new Promise((resolve) => p.on('close', resolve));
   // When stdin carries system-audio PCM we can't send 'q' there — kill (mkv remuxes
   // losslessly, verified). Without system audio, 'q' for a clean shutdown, kill as backstop.

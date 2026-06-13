@@ -112,10 +112,12 @@ export interface YouTubeBridge {
 export interface NativeAudioOpts {
   /** Capture system audio (WASAPI loopback) and mix it with the mic. */
   system: boolean;
-  /** Capture ONLY this process tree's audio (per-app, clean). 0/undefined = all system audio. */
-  systemPid?: number;
-  /** System-audio level trim in dB. */
+  /** Capture ONLY these process trees' audio (per-app, multi-select). []/undefined = all system. */
+  systemPids?: number[];
+  /** System-audio (internal) level trim in dB — operator-controlled. */
   sysGainDb?: number;
+  /** Mic level trim in dB — operator-controlled. */
+  micGainDb?: number;
 }
 
 export interface AudioApp {
