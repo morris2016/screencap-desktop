@@ -7,7 +7,7 @@ import { Recorder, Streamer } from './engine/recorder';
 import { MicSource, ScreenSource, WebcamSource } from './engine/sources';
 import { DEFAULT_FX, presetBands, VoiceChain, type VoiceFx } from './engine/voicechain';
 import { YouTubePanel } from './components/YouTubePanel';
-import type { CaptureSourceInfo, LinkInfo, Scene, SceneItem, Source } from './engine/types';
+import type { AudioApp, CaptureSourceInfo, LinkInfo, Scene, SceneItem, Source } from './engine/types';
 
 interface LibItem {
   name: string;
@@ -45,6 +45,12 @@ export function App() {
   const [fxMap, setFxMap] = useState<Record<string, VoiceFx>>({});
   const [fxOpen, setFxOpen] = useState<string | null>(null);
   const streamer = useMemo(() => new Streamer(), []);
+  // Internal-audio source: '' = all system audio; otherwise a process NAME (PID is resolved
+  // live at go-live, since PIDs change between runs). Keeps Discord clean & mic separate.
+  const [internalAppName, setInternalAppName] = useState(localStorage.getItem('internalApp') ?? '');
+  const [audioApps, setAudioApps] = useState<AudioApp[]>([]);
+  const refreshAudioApps = () => window.screencap.listAudioApps().then(setAudioApps);
+  useEffect(() => { void refreshAudioApps(); }, []);
   const [streamUrl, setStreamUrl] = useState(localStorage.getItem('streamUrl') ?? 'rtmp://a.rtmp.youtube.com/live2');
   // Native capture is the ONLY streaming engine now — ffmpeg captures screen + mic + system
   // audio directly (no Chromium in the media path). The old MediaRecorder pipe path and its
@@ -318,7 +324,7 @@ export function App() {
     }
     // Native-first (throttle-proof): direct mode → ffmpeg records screen + mic + system
     // audio (all native) itself. Scene mode keeps the compositor/MediaRecorder path.
-    const nat = nativeAudioPlan();
+    const nat = await nativeAudioPlan();
     if (directMode && (nat.micDevice || nat.audio.system)) {
       const res = await window.screencap.nativeRecordStart(nat.micDevice, nat.fx, nat.audio);
       if (res.ok) {
@@ -334,15 +340,22 @@ export function App() {
   }
 
   /** What the native ffmpeg pipeline should capture, from the current studio sources. */
-  function nativeAudioPlan() {
+  async function nativeAudioPlan() {
     const mic = directMode ? sources.find((s) => s.kind === 'mic') : undefined;
     const micDevice = mic?.label ?? null;
     // System audio (Discord, music, game) is captured natively (WASAPI loopback) when the
     // user streams any screen/system source; fallback on so a mic-less direct stream isn't silent.
     let system = directMode && sources.some((s) => s.kind === 'screen' && !!s.audioNode);
     if (directMode && !micDevice && !system) system = true;
+    // Per-app internal audio: resolve the chosen process name → its CURRENT pid so only that
+    // app's sound is captured (clean Discord), kept separate from the mic. '' = all system.
+    let systemPid = 0;
+    if (system && internalAppName) {
+      const apps = await window.screencap.listAudioApps();
+      systemPid = apps.find((a) => a.name === internalAppName)?.pid ?? 0;
+    }
     const fx = micDevice && mic ? chains.get(mic.id)?.settings ?? null : null;
-    return { micDevice, fx, audio: { system, sysGainDb: 0 } };
+    return { micDevice, fx, audio: { system, systemPid, sysGainDb: 0 } };
   }
 
   function stopStream() {
@@ -360,7 +373,7 @@ export function App() {
     // FULLY NATIVE audio: ffmpeg captures the mic (DirectShow) AND system audio (native
     // WASAPI loopback, wasaploop.exe) and mixes them in-filter. No Chromium in the live
     // path → immune to renderer/occlusion throttling (the switch-away breaking).
-    const nat = nativeAudioPlan();
+    const nat = await nativeAudioPlan();
     streamIsNative.current = directMode && (!!nat.micDevice || nat.audio.system);
     const err = await streamer.start(
       compositor.captureStream(30), mixer.stream, url, key, 6000, directMode,
@@ -495,6 +508,29 @@ export function App() {
               )}
             </div>
           ))}
+
+          <div style={{ marginTop: 14 }}>
+            <h2 style={{ margin: '0 0 6px' }}>🔊 Internal audio</h2>
+            <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+              <select
+                className="add" style={{ flex: 1, marginBottom: 0 }}
+                value={internalAppName}
+                onMouseDown={refreshAudioApps}
+                onChange={(e) => { setInternalAppName(e.target.value); localStorage.setItem('internalApp', e.target.value); }}
+              >
+                <option value="">All system audio</option>
+                {audioApps.map((a) => (
+                  <option key={a.name} value={a.name}>{a.name}{a.title ? ` — ${a.title.slice(0, 32)}` : ''}</option>
+                ))}
+              </select>
+              <button className="add" style={{ width: 36, marginBottom: 0 }} title="Refresh app list" onClick={refreshAudioApps}>🔄</button>
+            </div>
+            <small style={{ color: 'var(--dim)' }}>
+              {internalAppName
+                ? `Streaming only ${internalAppName}'s audio — captured cleanly, separate from your mic.`
+                : 'Capturing all system audio. Pick an app (e.g. Discord) to stream only its sound.'}
+            </small>
+          </div>
 
           <div style={{ marginTop: 14 }}>
             <YouTubePanel live={live} startStream={startStream} stopStream={stopStream} />

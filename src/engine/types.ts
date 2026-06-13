@@ -112,8 +112,16 @@ export interface YouTubeBridge {
 export interface NativeAudioOpts {
   /** Capture system audio (WASAPI loopback) and mix it with the mic. */
   system: boolean;
+  /** Capture ONLY this process tree's audio (per-app, clean). 0/undefined = all system audio. */
+  systemPid?: number;
   /** System-audio level trim in dB. */
   sysGainDb?: number;
+}
+
+export interface AudioApp {
+  pid: number;
+  name: string;
+  title: string;
 }
 
 declare global {
@@ -148,6 +156,7 @@ declare global {
       voiceFxAssets(): Promise<{ rnnoiseWorklet: string; rnnoiseWasm: Uint8Array; error?: string }>;
       sessionActive(on: boolean): void;
       openExternal(url: string): Promise<void>;
+      listAudioApps(): Promise<AudioApp[]>;
       nativeRecordStart(micDevice: string | null, fx: unknown, audio: NativeAudioOpts): Promise<{ ok: boolean; error?: string }>;
       nativeRecordStop(): Promise<string | null>;
       onNativeRecordFailed(cb: () => void): void;

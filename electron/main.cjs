@@ -196,6 +196,7 @@ const stream = {
   direct: false,        // ddagrab native screen capture (video never touches Chromium)
   micDevice: null,      // dshow device name → FULLY native audio (no Chromium in the path)
   wantSystem: false,    // also capture system audio (WASAPI loopback) and mix it with the mic
+  systemPid: 0,         // capture ONLY this process tree's audio (per-app); 0 = all system
   sysGainDb: 0,         // system-audio level trim in dB
   sysProc: null,        // the wasaploop child feeding system audio into ffmpeg stdin
   fx: null,             // VoiceFx settings from the renderer → ffmpeg filter chain
@@ -373,7 +374,9 @@ function spawnStream() {
   if (useSysPipe) {
     const wp = wasaplooPath();
     if (wp) {
-      const sysProc = spawn(wp, [], { stdio: ['ignore', 'pipe', 'ignore'] });
+      // PID arg = capture ONLY that app's audio (clean Discord); none = all system audio.
+      const args = stream.systemPid ? [String(stream.systemPid)] : [];
+      const sysProc = spawn(wp, args, { stdio: ['ignore', 'pipe', 'ignore'] });
       sysProc.on('error', () => {});
       sysProc.stdout.on('error', () => {});
       try { sysProc.stdout.pipe(p.stdin); } catch {}
@@ -514,6 +517,7 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx, au
   stream.micDevice = (direct && micDevice) || null;
   stream.fx = fx || null;
   stream.wantSystem = !!(direct && audio && audio.system);
+  stream.systemPid = (audio && Number(audio.systemPid)) || 0;
   stream.sysGainDb = (audio && typeof audio.sysGainDb === 'number') ? audio.sysGainDb : 0;
   stream.qsvBroken = false; // re-probe QuickSync each go-live
   stream.wanted = true;
@@ -594,7 +598,8 @@ ipcMain.handle('native-record-start', (e, micDevice, fx, audio) => {
   if (na.usePipe) {
     const wp = wasaplooPath();
     if (wp) {
-      const sysProc = spawn(wp, [], { stdio: ['ignore', 'pipe', 'ignore'] });
+      const sysPid = (audio && Number(audio.systemPid)) || 0;
+      const sysProc = spawn(wp, sysPid ? [String(sysPid)] : [], { stdio: ['ignore', 'pipe', 'ignore'] });
       sysProc.on('error', () => {});
       sysProc.stdout.on('error', () => {});
       try { sysProc.stdout.pipe(p.stdin); } catch {}
@@ -692,6 +697,29 @@ function ytHandle(channel, fn) {
 }
 ipcMain.handle('open-external', (e, url) => {
   if (/^https:\/\//.test(url)) require('electron').shell.openExternal(url);
+});
+// Running apps with a window (for the per-app internal-audio picker) → [{pid,name,title}].
+ipcMain.handle('list-audio-apps', () => {
+  return new Promise((resolve) => {
+    require('child_process').execFile('powershell.exe', ['-NoProfile', '-Command',
+      "Get-Process | Where-Object { $_.MainWindowTitle } | Select-Object Id,ProcessName,MainWindowTitle | ConvertTo-Json -Compress"],
+      { windowsHide: true, timeout: 5000 }, (err, stdout) => {
+        if (err) return resolve([]);
+        try {
+          let arr = JSON.parse(stdout);
+          if (!Array.isArray(arr)) arr = [arr];
+          // De-dup by process name (one entry per app), keep the longest title.
+          const byName = new Map();
+          for (const a of arr) {
+            const cur = byName.get(a.ProcessName);
+            if (!cur || (a.MainWindowTitle || '').length > (cur.title || '').length) {
+              byName.set(a.ProcessName, { pid: a.Id, name: a.ProcessName, title: a.MainWindowTitle });
+            }
+          }
+          resolve([...byName.values()]);
+        } catch { resolve([]); }
+      });
+  });
 });
 ytHandle('yt-status', (s) => s.getStatus());
 ytHandle('yt-set-credentials', (s, id, secret) => s.setCredentials(id, secret));
