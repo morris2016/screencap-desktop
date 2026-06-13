@@ -94,6 +94,7 @@ export interface YouTubeBridge {
   listBroadcasts(): Promise<YtResult<YtBroadcast[]>>;
   createBroadcast(opts: YtCreateOpts): Promise<YtResult<{ id: string; liveChatId: string; title: string }>>;
   prepareStream(broadcastId: string): Promise<YtResult<YtStreamInfo>>;
+  prepareLive(opts: YtCreateOpts): Promise<YtResult<YtStreamInfo & { broadcastId: string; liveChatId: string }>>;
   streamHealth(streamId: string): Promise<YtResult<string>>;
   broadcastStatus(broadcastId: string): Promise<YtResult<{ lifeCycleStatus?: string; streamStatus?: string }>>;
   transition(broadcastId: string, status: 'testing' | 'live' | 'complete'): Promise<YtResult<unknown>>;

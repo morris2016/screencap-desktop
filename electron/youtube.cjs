@@ -317,6 +317,53 @@ class YouTubeService {
     return s; // { streamId, ingestionAddress, streamName }
   }
 
+  deleteBroadcast(id) {
+    return this.apiFetch(`${API}/liveBroadcasts?id=${id}`, { method: 'DELETE' });
+  }
+
+  async _listNonComplete() {
+    const out = [];
+    for (const st of ['upcoming', 'active']) {
+      try {
+        const j = await this.apiFetch(
+          `${API}/liveBroadcasts?part=snippet,status,contentDetails&broadcastStatus=${st}&maxResults=50&mine=true`,
+        );
+        out.push(...(j.items || []));
+      } catch {}
+    }
+    return out;
+  }
+
+  /** Free the reusable stream: complete any live leftovers, delete pre-live ones still
+   *  bound to it (the "stream key is currently assigned" error comes from this pile). */
+  async _cleanupBoundBroadcasts(streamId, exceptId) {
+    const all = await this._listNonComplete();
+    for (const b of all) {
+      if (b.id === exceptId) continue;
+      if (b.contentDetails?.boundStreamId !== streamId) continue;
+      const lc = b.status?.lifeCycleStatus;
+      try {
+        if (lc === 'live' || lc === 'liveStarting') await this.transition(b.id, 'complete');
+        else await this.deleteBroadcast(b.id);
+      } catch {}
+    }
+  }
+
+  /** One call the UI uses to go live: free the stream, create a fresh broadcast, bind it. */
+  async prepareLive(opts) {
+    const stream = await this.getOrCreateStream();
+    await this._cleanupBoundBroadcasts(stream.streamId, null);
+    const b = await this.createBroadcast(opts);
+    await this.bind(b.id, stream.streamId);
+    return {
+      broadcastId: b.id,
+      liveChatId: b.liveChatId,
+      streamId: stream.streamId,
+      ingestionAddress: stream.ingestionAddress,
+      streamName: stream.streamName,
+    };
+  }
+
   // ---- chat + moderation ----
   chatStart(liveChatId, onMessages) {
     this.chatStop();

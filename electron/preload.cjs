@@ -34,6 +34,7 @@ contextBridge.exposeInMainWorld('screencap', {
     listBroadcasts: () => ipcRenderer.invoke('yt-list-broadcasts'),
     createBroadcast: (opts) => ipcRenderer.invoke('yt-create-broadcast', opts),
     prepareStream: (broadcastId) => ipcRenderer.invoke('yt-prepare-stream', broadcastId),
+    prepareLive: (opts) => ipcRenderer.invoke('yt-prepare-live', opts),
     streamHealth: (streamId) => ipcRenderer.invoke('yt-stream-health', streamId),
     broadcastStatus: (broadcastId) => ipcRenderer.invoke('yt-broadcast-status', broadcastId),
     transition: (broadcastId, status) => ipcRenderer.invoke('yt-transition', broadcastId, status),

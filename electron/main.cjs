@@ -572,6 +572,7 @@ ytHandle('yt-sign-out', (s) => s.signOut());
 ytHandle('yt-list-broadcasts', (s) => s.listBroadcasts());
 ytHandle('yt-create-broadcast', (s, opts) => s.createBroadcast(opts));
 ytHandle('yt-prepare-stream', (s, broadcastId) => s.prepareStream(broadcastId));
+ytHandle('yt-prepare-live', (s, opts) => s.prepareLive(opts));
 ytHandle('yt-stream-health', (s, streamId) => s.streamHealth(streamId));
 ytHandle('yt-broadcast-status', (s, broadcastId) => s.getBroadcastStatus(broadcastId));
 ytHandle('yt-transition', (s, broadcastId, status) => s.transition(broadcastId, status));

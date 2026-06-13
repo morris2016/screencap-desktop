@@ -94,30 +94,28 @@ export function YouTubePanel({ live, startStream, stopStream }: Props) {
     localStorage.setItem('yt.privacy', privacy);
     localStorage.setItem('yt.latency', latency);
 
-    setBusy('Creating broadcast…');
-    const b = await unwrap(yt().createBroadcast({ title, privacy, latency }), setErr);
-    if (!b) return setBusy('');
-
-    setBusy('Fetching stream key…');
-    const s = await unwrap(yt().prepareStream(b.id), setErr);
-    if (!s) return setBusy('');
+    // One call frees the stream key (deletes stale broadcasts from earlier attempts —
+    // the "stream key currently assigned" error), creates a fresh broadcast, binds it.
+    setBusy('Preparing broadcast…');
+    const p = await unwrap(yt().prepareLive({ title, privacy, latency }), setErr);
+    if (!p) return setBusy('');
 
     setBusy('Starting encoder…');
-    const streamErr = await startStream(s.ingestionAddress, s.streamName);
+    const streamErr = await startStream(p.ingestionAddress, p.streamName);
     if (streamErr) { setErr(streamErr); return setBusy(''); }
 
     // enableAutoStart: YouTube flips the broadcast to live as soon as it sees the ingest.
     // We just poll the broadcast lifecycle until it's actually live, then open chat.
     setBusy('Waiting for YouTube to go live…');
-    const wentLive = await waitForLive(b.id);
+    const wentLive = await waitForLive(p.broadcastId);
     setBusy('');
     if (!wentLive) {
       setErr('Stream is connecting — YouTube has not gone live yet. Leave it running; it can take ~30s.');
       // keep the encoder running and still open chat; the broadcast will go live shortly
     }
-    yt().chatStart(b.liveChatId);
+    yt().chatStart(p.liveChatId);
     setMessages([]);
-    setBroadcast({ id: b.id, liveChatId: b.liveChatId, streamId: s.streamId });
+    setBroadcast({ id: p.broadcastId, liveChatId: p.liveChatId, streamId: p.streamId });
   }
 
   async function waitForLive(broadcastId: string): Promise<boolean> {
