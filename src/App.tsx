@@ -6,6 +6,7 @@ import { PhoneSource } from './engine/phonesource';
 import { Recorder, Streamer } from './engine/recorder';
 import { MicSource, ScreenSource, WebcamSource } from './engine/sources';
 import { DEFAULT_FX, presetBands, VoiceChain, type VoiceFx } from './engine/voicechain';
+import { YouTubePanel } from './components/YouTubePanel';
 import type { CaptureSourceInfo, LinkInfo, Scene, SceneItem, Source } from './engine/types';
 
 interface LibItem {
@@ -325,18 +326,16 @@ export function App() {
     legacyRecord();
   }
 
-  async function goLive(url: string, key: string) {
-    if (live) {
-      streamer.stop();
-      setLive(false);
-      setStatus('stream stopped');
-      window.screencap.sessionActive(recorder.state !== 'inactive');
-      return;
-    }
-    if (!key) {
-      setStatus('enter your stream key first');
-      return;
-    }
+  function stopStream() {
+    streamer.stop();
+    setLive(false);
+    setStatus('stream stopped');
+    window.screencap.sessionActive(recorder.state !== 'inactive');
+  }
+
+  /** Start the native pipeline to an explicit ingest URL + key. Returns an error or null. */
+  async function startStream(url: string, key: string): Promise<string | null> {
+    if (!key) return 'no stream key';
     setStatus('starting stream…');
     // FULLY NATIVE audio (panel plan B — the throttling-proof path): when a mic is in
     // the studio, ffmpeg captures it directly via DirectShow and runs the voice chain
@@ -356,16 +355,27 @@ export function App() {
       compositor.captureStream(30), mixer.stream, url, key, 6800, directMode,
       nativeMic, nativeMic && mic ? chains.get(mic.id)?.settings ?? null : null,
     );
-    if (err) setStatus(`stream failed: ${err}`);
-    else {
-      setLive(true);
-      setStatus(
-        nativeMic
-          ? `🔴 connecting… (FULLY NATIVE: screen + ${nativeMic} + voice chain)`
-          : directMode ? '🔴 connecting… (direct native capture)' : '🔴 connecting…',
-      );
-      window.screencap.sessionActive(true);
+    if (err) {
+      setStatus(`stream failed: ${err}`);
+      return err;
     }
+    setLive(true);
+    setStatus(
+      nativeMic
+        ? `🔴 connecting… (FULLY NATIVE: screen + ${nativeMic} + voice chain)`
+        : directMode ? '🔴 connecting… (direct native capture)' : '🔴 connecting…',
+    );
+    window.screencap.sessionActive(true);
+    return null;
+  }
+
+  async function goLive(url: string, key: string) {
+    if (live) return stopStream();
+    if (!key) {
+      setStatus('enter your stream key first');
+      return;
+    }
+    await startStream(url, key);
   }
 
   const toggleLive = () => goLive(streamUrl, streamKey);
@@ -472,29 +482,38 @@ export function App() {
             </div>
           ))}
 
-          <h2 style={{ marginTop: 14 }}>Go Live</h2>
-          <input
-            className="add" style={{ textAlign: 'left' }} placeholder="RTMP URL"
-            value={streamUrl}
-            onChange={(e) => { setStreamUrl(e.target.value); localStorage.setItem('streamUrl', e.target.value); }}
-          />
-          <input
-            className="add" style={{ textAlign: 'left' }} placeholder="Stream key" type="password"
-            value={streamKey}
-            onChange={(e) => { setStreamKey(e.target.value); localStorage.setItem('streamKey', e.target.value); }}
-          />
-          <label
-            style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, opacity: 0.9, margin: '4px 0 8px', cursor: 'pointer' }}
-            title="Video is captured natively by ffmpeg (Desktop Duplication) — maximum stability, streams your full screen. Untick to stream the composited scenes (phone cam, overlays) instead."
-          >
+          <div style={{ marginTop: 14 }}>
+            <YouTubePanel live={live} startStream={startStream} stopStream={stopStream} />
+          </div>
+
+          <details style={{ marginTop: 12 }}>
+            <summary style={{ cursor: 'pointer', fontSize: 13, color: 'var(--dim)' }}>Custom RTMP (advanced)</summary>
             <input
-              type="checkbox"
-              checked={directMode}
-              onChange={(e) => { setDirectMode(e.target.checked); localStorage.setItem('directMode', e.target.checked ? '1' : '0'); }}
+              className="add" style={{ textAlign: 'left', marginTop: 8 }} placeholder="RTMP URL"
+              value={streamUrl}
+              onChange={(e) => { setStreamUrl(e.target.value); localStorage.setItem('streamUrl', e.target.value); }}
             />
-            🖥️ Direct native capture (most stable — streams full screen, not scenes)
-          </label>
-          <button className="add" onClick={testLocal}>🧪 Test stream (local harness)</button>
+            <input
+              className="add" style={{ textAlign: 'left' }} placeholder="Stream key" type="password"
+              value={streamKey}
+              onChange={(e) => { setStreamKey(e.target.value); localStorage.setItem('streamKey', e.target.value); }}
+            />
+            <label
+              style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, opacity: 0.9, margin: '4px 0 8px', cursor: 'pointer' }}
+              title="Video is captured natively by ffmpeg (Desktop Duplication) — maximum stability, streams your full screen. Untick to stream the composited scenes (phone cam, overlays) instead."
+            >
+              <input
+                type="checkbox"
+                checked={directMode}
+                onChange={(e) => { setDirectMode(e.target.checked); localStorage.setItem('directMode', e.target.checked ? '1' : '0'); }}
+              />
+              🖥️ Direct native capture (most stable — streams full screen, not scenes)
+            </label>
+            <button className="add" onClick={() => goLive(streamUrl, streamKey)}>
+              {live ? '⏹ End stream' : '🔴 Go Live (custom)'}
+            </button>
+            <button className="add" onClick={testLocal}>🧪 Test stream (local harness)</button>
+          </details>
         </div>
 
         {audioAlert && (

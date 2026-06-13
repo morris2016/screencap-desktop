@@ -46,6 +46,67 @@ export interface Scene {
   items: SceneItem[];
 }
 
+// ---- YouTube Live integration ----
+export type YtResult<T> = { ok: true; data: T } | { ok: false; error: string; reason: string | null };
+export interface YtStatus {
+  hasCreds: boolean;
+  signedIn: boolean;
+  channelTitle: string | null;
+  channelId: string | null;
+  encrypted: boolean;
+}
+export interface YtBroadcast {
+  id: string;
+  title: string;
+  privacy: string;
+  lifeCycle: string;
+  liveChatId: string;
+  scheduledStartTime: string;
+}
+export interface YtStreamInfo {
+  streamId: string;
+  ingestionAddress: string;
+  streamName: string;
+}
+export interface YtChatMessage {
+  id: string;
+  authorName: string;
+  authorChannelId: string;
+  text: string;
+  isMod: boolean;
+  isOwner: boolean;
+  isSuperChat: boolean;
+  amount: string | null;
+  publishedAt: string;
+}
+export interface YtCreateOpts {
+  title: string;
+  description?: string;
+  privacy: 'public' | 'unlisted' | 'private';
+  scheduledStartTime?: string;
+  latency?: 'normal' | 'low' | 'ultraLow';
+}
+export interface YouTubeBridge {
+  status(): Promise<YtResult<YtStatus>>;
+  setCredentials(id: string, secret: string): Promise<YtResult<YtStatus>>;
+  signIn(): Promise<YtResult<YtStatus>>;
+  signOut(): Promise<YtResult<YtStatus>>;
+  listBroadcasts(): Promise<YtResult<YtBroadcast[]>>;
+  createBroadcast(opts: YtCreateOpts): Promise<YtResult<{ id: string; liveChatId: string; title: string }>>;
+  prepareStream(broadcastId: string): Promise<YtResult<YtStreamInfo>>;
+  streamHealth(streamId: string): Promise<YtResult<string>>;
+  broadcastStatus(broadcastId: string): Promise<YtResult<{ lifeCycleStatus?: string; streamStatus?: string }>>;
+  transition(broadcastId: string, status: 'testing' | 'live' | 'complete'): Promise<YtResult<unknown>>;
+  setThumbnail(broadcastId: string, filePath: string): Promise<YtResult<unknown>>;
+  chatStart(liveChatId: string): void;
+  chatStop(): void;
+  chatSend(liveChatId: string, text: string): Promise<YtResult<unknown>>;
+  chatDelete(messageId: string): Promise<YtResult<unknown>>;
+  chatBan(liveChatId: string, channelId: string, seconds: number | null): Promise<YtResult<unknown>>;
+  chatAddMod(liveChatId: string, channelId: string): Promise<YtResult<unknown>>;
+  onChatMessages(cb: (msgs: YtChatMessage[]) => void): void;
+}
+
 declare global {
   interface Window {
     screencap: {
@@ -76,9 +137,11 @@ declare global {
       onStreamResume(cb: () => void): void;
       voiceFxAssets(): Promise<{ rnnoiseWorklet: string; rnnoiseWasm: Uint8Array; error?: string }>;
       sessionActive(on: boolean): void;
+      openExternal(url: string): Promise<void>;
       nativeRecordStart(micDevice: string | null, fx: unknown): Promise<{ ok: boolean; error?: string }>;
       nativeRecordStop(): Promise<string | null>;
       onNativeRecordFailed(cb: () => void): void;
+      yt: YouTubeBridge;
     };
   }
 }

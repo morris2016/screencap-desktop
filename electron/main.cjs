@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog, desktopCapturer, powerSaveBlocker }
 const fs = require('fs');
 const path = require('path');
 const { LinkServer } = require('./linkserver.cjs');
+const { YouTubeService } = require('./youtube.cjs');
 
 // ONE disable-features list — a second appendSwitch('disable-features') call silently
 // OVERWRITES this one and resurrects the WGC E_FAIL capture bug. Two bug classes killed here:
@@ -542,6 +543,47 @@ ipcMain.handle('voicefx-assets', () => {
     return { error: String(e) };
   }
 });
+
+// ---- YouTube Live integration (OAuth + broadcast control + chat/moderation).
+// Lazy singleton: constructed on first use, after app is ready (safeStorage/userData). ----
+let _yt = null;
+function yt() {
+  if (!_yt) _yt = new YouTubeService();
+  return _yt;
+}
+// Uniform wrapper: every yt-* call returns {ok, data}|{ok:false, error, reason} so the
+// renderer never has to try/catch IPC and quota errors surface cleanly.
+function ytHandle(channel, fn) {
+  ipcMain.handle(channel, async (e, ...args) => {
+    try {
+      return { ok: true, data: await fn(yt(), ...args) };
+    } catch (err) {
+      return { ok: false, error: err.message || String(err), reason: err.reason || null };
+    }
+  });
+}
+ipcMain.handle('open-external', (e, url) => {
+  if (/^https:\/\//.test(url)) require('electron').shell.openExternal(url);
+});
+ytHandle('yt-status', (s) => s.getStatus());
+ytHandle('yt-set-credentials', (s, id, secret) => s.setCredentials(id, secret));
+ytHandle('yt-sign-in', (s) => s.signIn());
+ytHandle('yt-sign-out', (s) => s.signOut());
+ytHandle('yt-list-broadcasts', (s) => s.listBroadcasts());
+ytHandle('yt-create-broadcast', (s, opts) => s.createBroadcast(opts));
+ytHandle('yt-prepare-stream', (s, broadcastId) => s.prepareStream(broadcastId));
+ytHandle('yt-stream-health', (s, streamId) => s.streamHealth(streamId));
+ytHandle('yt-broadcast-status', (s, broadcastId) => s.getBroadcastStatus(broadcastId));
+ytHandle('yt-transition', (s, broadcastId, status) => s.transition(broadcastId, status));
+ytHandle('yt-set-thumbnail', (s, broadcastId, filePath) => s.setThumbnail(broadcastId, filePath));
+ytHandle('yt-chat-send', (s, liveChatId, text) => s.chatSend(liveChatId, text));
+ytHandle('yt-chat-delete', (s, messageId) => s.chatDelete(messageId));
+ytHandle('yt-chat-ban', (s, liveChatId, channelId, seconds) => s.ban(liveChatId, channelId, seconds));
+ytHandle('yt-chat-add-mod', (s, liveChatId, channelId) => s.addModerator(liveChatId, channelId));
+ipcMain.on('yt-chat-start', (e, liveChatId) => {
+  yt().chatStart(liveChatId, (msgs) => sendAll('yt-chat-messages', msgs));
+});
+ipcMain.on('yt-chat-stop', () => yt().chatStop());
 
 app.whenReady().then(() => {
   createWindow();
