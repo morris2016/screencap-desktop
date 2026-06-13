@@ -338,16 +338,14 @@ class YouTubeService {
   }
 
   /** Free the reusable stream: complete any live leftovers, delete pre-live ones still
-   *  bound to it (the "stream key is currently assigned" error comes from this pile). */
+   *  bound to it (the "stream key is currently assigned" error comes from this pile).
+   *  Scoped to broadcasts ACTUALLY bound to our stream — deleting every same-titled
+   *  broadcast burned Data-API quota (50 units each) during repeated test go-lives. */
   async _cleanupBoundBroadcasts(streamId, exceptId) {
     const all = await this._listNonComplete();
     for (const b of all) {
       if (b.id === exceptId) continue;
-      // Clean up anything bound to our stream OR any leftover broadcast this app created
-      // (title match) — clears the pile from earlier attempts regardless of stream.
-      const boundToUs = b.contentDetails?.boundStreamId === streamId;
-      const ours = b.snippet?.title === 'ScreenCap Studio Live';
-      if (!boundToUs && !ours) continue;
+      if (b.contentDetails?.boundStreamId !== streamId) continue;
       const lc = b.status?.lifeCycleStatus;
       try {
         if (lc === 'live' || lc === 'liveStarting') await this.transition(b.id, 'complete');
