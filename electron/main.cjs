@@ -301,9 +301,15 @@ function spawnStream() {
   ]);
   p.usedQsv = useQsv;
   stream.proc = p;
-  // Below-normal priority: ffmpeg gets all SPARE cpu but never preempts the audio
-  // engine or UI. Combined with -threads this kills the live-session audio glitching.
-  try { require('os').setPriority(p.pid, require('os').constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
+  // Priority by mode. NATIVE mode: ffmpeg IS the capture+encode+audio, so it must run
+  // HIGH — otherwise Windows background-throttles our process the instant the app loses
+  // foreground, the ddagrab grab collapses to ~0.5x, and the audio shreds (field bug:
+  // "clean when focused, breaks when I switch away"). PIPE mode: the renderer's audio
+  // engine is the critical path, so keep ffmpeg below-normal to not preempt it.
+  try {
+    const os = require('os');
+    os.setPriority(p.pid, stream.direct ? os.constants.priority.PRIORITY_HIGH : os.constants.priority.PRIORITY_BELOW_NORMAL);
+  } catch {}
   stream.spawnMs = Date.now();
   stream.lastProgressMs = Date.now();
   stream.awaitingFresh = true; // gate stdin until a fresh container header arrives
@@ -484,7 +490,9 @@ ipcMain.handle('native-record-start', (e, micDevice, fx) => {
     ...(micDevice ? ['-af', voiceChainFilter(fx), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000'] : []),
     '-y', nrec.tmp,
   ]);
-  try { require('os').setPriority(p.pid, require('os').constants.priority.PRIORITY_BELOW_NORMAL); } catch {}
+  // HIGH priority: native recorder must survive the app being backgrounded (same
+  // background-throttling that crashed the live capture when the app lost focus).
+  try { require('os').setPriority(p.pid, require('os').constants.priority.PRIORITY_HIGH); } catch {}
   p.stdin.on('error', () => {});
   p.on('error', () => {});
   const spawnedAt = Date.now();
