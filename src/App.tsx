@@ -50,6 +50,10 @@ export function App() {
   const [streamKey, setStreamKey] = useState(localStorage.getItem('streamKey') ?? '');
   const [live, setLive] = useState(false);
   const [audioAlert, setAudioAlert] = useState<string | null>(null);
+  // True only when the WebAudio mixer is actually feeding a live consumer (legacy
+  // recording / scene streaming). In native mode (ffmpeg captures the mic itself) the
+  // mixer isn't in the path, so a starvation warning there is a false alarm.
+  const streamIsNative = useRef(false);
 
   useEffect(() => {
     void mixer.startWatchdog(setAudioAlert);
@@ -355,6 +359,7 @@ export function App() {
     // 4500k: within YouTube's 1080p30 range, and crucially it leaves the shared Intel
     // iGPU enough headroom to capture (ddagrab) AND encode (QSV) at realtime on a busy
     // desktop — 6800k drove the encoder below 1.0x (dup/drop, watchdog restarts).
+    streamIsNative.current = !!nativeMic;
     const err = await streamer.start(
       compositor.captureStream(30), mixer.stream, url, key, 4500, directMode,
       nativeMic, nativeMic && mic ? chains.get(mic.id)?.settings ?? null : null,
@@ -523,7 +528,11 @@ export function App() {
           </details>
         </div>
 
-        {audioAlert && (
+        {audioAlert &&
+          // Only meaningful when the WebAudio mixer actually feeds a live consumer:
+          // legacy recording (not native) or a scene/pipe stream (not native).
+          ((recState !== 'inactive' && nativeRecStart.current === null) ||
+            (live && !streamIsNative.current)) && (
           <div
             style={{
               position: 'fixed', top: 8, left: '50%', transform: 'translateX(-50%)', zIndex: 100,
