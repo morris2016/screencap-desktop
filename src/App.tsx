@@ -295,6 +295,7 @@ export function App() {
       // Stop native recording: clean ffmpeg shutdown + remux.
       nativeRecStart.current = null;
       setRecState('inactive');
+      compositor.setPreviewFps(live ? 10 : 30);
       const saved = await window.screencap.nativeRecordStop();
       window.screencap.sessionActive(live);
       setStatus(saved ? `saved → ${saved}` : 'save failed');
@@ -319,6 +320,7 @@ export function App() {
         nativeRecStart.current = Date.now();
         setRecState('recording');
         setStatus('● recording (fully native: screen + mic + voice chain)');
+        compositor.setPreviewFps(10); // free the iGPU for ddagrab+QSV
         window.screencap.sessionActive(true);
         return;
       }
@@ -330,6 +332,7 @@ export function App() {
     streamer.stop();
     setLive(false);
     setStatus('stream stopped');
+    compositor.setPreviewFps(nativeRecStart.current !== null ? 10 : 30);
     window.screencap.sessionActive(recorder.state !== 'inactive');
   }
 
@@ -366,6 +369,9 @@ export function App() {
         ? `🔴 connecting… (FULLY NATIVE: screen + ${nativeMic} + voice chain)`
         : directMode ? '🔴 connecting… (direct native capture)' : '🔴 connecting…',
     );
+    // Native stream captures the screen itself — throttle the preview canvas so it stops
+    // competing with ddagrab+QSV for the iGPU (the cause of the <1.0x audio drops).
+    if (nativeMic) compositor.setPreviewFps(10);
     window.screencap.sessionActive(true);
     return null;
   }

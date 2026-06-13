@@ -13,6 +13,8 @@ export class Compositor {
   private prevScene: Scene | null = null;
   private fadeStart = 0;
   private raf = 0;
+  private minInterval = 1000 / 30; // cap preview at 30fps; raised during native sessions
+  private lastRender = 0;
   private static FADE_MS = 300;
 
   constructor(width = 1920, height = 1080) {
@@ -20,11 +22,20 @@ export class Compositor {
     this.canvas.width = width;
     this.canvas.height = height;
     this.ctx = this.canvas.getContext('2d')!;
-    const loop = () => {
-      this.render();
+    const loop = (t: number) => {
+      if (t - this.lastRender >= this.minInterval) {
+        this.lastRender = t;
+        this.render();
+      }
       this.raf = requestAnimationFrame(loop);
     };
     this.raf = requestAnimationFrame(loop);
+  }
+
+  /** Throttle the preview to free the iGPU for ddagrab+QSV during native streaming/recording
+   *  (the composited canvas isn't part of the native stream — it's only a monitor). */
+  setPreviewFps(fps: number) {
+    this.minInterval = 1000 / Math.max(1, fps);
   }
 
   registerSource(s: Source) {

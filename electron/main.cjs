@@ -237,8 +237,10 @@ function spawnStream() {
   const nativeAudio = stream.direct && !!stream.micDevice;
   const audioIn = nativeAudio
     ? [
-        '-f', 'dshow', '-audio_buffer_size', '50', '-thread_queue_size', '1024',
-        '-i', `audio=${stream.micDevice}`,
+        // rtbufsize cushions the live mic against transient sub-realtime spikes so dshow
+        // doesn't drop audio frames (the "buffer too full" shaky-voice symptom).
+        '-f', 'dshow', '-audio_buffer_size', '80', '-thread_queue_size', '4096',
+        '-rtbufsize', '64M', '-i', `audio=${stream.micDevice}`,
       ]
     : [
         '-fflags', 'nobuffer', '-probesize', '65536', '-analyzeduration', '500000', '-i', 'pipe:0',
@@ -468,7 +470,7 @@ ipcMain.handle('native-record-start', (e, micDevice, fx) => {
     '-init_hw_device', 'd3d11va=dx', '-init_hw_device', 'qsv=qs@dx', '-filter_hw_device', 'dx',
     '-filter_complex', 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]',
     ...(micDevice
-      ? ['-f', 'dshow', '-audio_buffer_size', '50', '-thread_queue_size', '1024', '-i', `audio=${micDevice}`]
+      ? ['-f', 'dshow', '-audio_buffer_size', '80', '-thread_queue_size', '4096', '-rtbufsize', '64M', '-i', `audio=${micDevice}`]
       : []),
     '-map', '[v]', ...(micDevice ? ['-map', '0:a'] : []),
     '-c:v', 'h264_qsv', '-preset', 'fast', '-b:v', '8000k', '-maxrate', '8000k',
