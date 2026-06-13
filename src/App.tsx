@@ -46,7 +46,11 @@ export function App() {
   const [fxOpen, setFxOpen] = useState<string | null>(null);
   const streamer = useMemo(() => new Streamer(), []);
   const [streamUrl, setStreamUrl] = useState(localStorage.getItem('streamUrl') ?? 'rtmp://a.rtmp.youtube.com/live2');
-  const [directMode, setDirectMode] = useState(localStorage.getItem('directMode') !== '0');
+  // Native capture is the ONLY streaming engine now — ffmpeg captures screen + mic + system
+  // audio directly (no Chromium in the media path). The old MediaRecorder pipe path and its
+  // footgun toggle are gone; this constant stays true so the native branches always run.
+  const directMode = true;
+  localStorage.removeItem('directMode'); // clear any persisted "off" from the old toggle
   const [streamKey, setStreamKey] = useState(localStorage.getItem('streamKey') ?? '');
   const [live, setLive] = useState(false);
   const [audioAlert, setAudioAlert] = useState<string | null>(null);
@@ -508,17 +512,9 @@ export function App() {
               value={streamKey}
               onChange={(e) => { setStreamKey(e.target.value); localStorage.setItem('streamKey', e.target.value); }}
             />
-            <label
-              style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, opacity: 0.9, margin: '4px 0 8px', cursor: 'pointer' }}
-              title="Video is captured natively by ffmpeg (Desktop Duplication) — maximum stability, streams your full screen. Untick to stream the composited scenes (phone cam, overlays) instead."
-            >
-              <input
-                type="checkbox"
-                checked={directMode}
-                onChange={(e) => { setDirectMode(e.target.checked); localStorage.setItem('directMode', e.target.checked ? '1' : '0'); }}
-              />
-              🖥️ Direct native capture (most stable — streams full screen, not scenes)
-            </label>
+            <div style={{ fontSize: 11, color: 'var(--dim)', margin: '4px 0 8px' }}>
+              🖥️ Native capture (ffmpeg: screen + mic + system audio) — always on.
+            </div>
             <button className="add" onClick={() => goLive(streamUrl, streamKey)}>
               {live ? '⏹ End stream' : '🔴 Go Live (custom)'}
             </button>

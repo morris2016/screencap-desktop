@@ -4,6 +4,28 @@ const path = require('path');
 const { LinkServer } = require('./linkserver.cjs');
 const { YouTubeService } = require('./youtube.cjs');
 
+// ---- Run elevated (admin). An elevated process and its ffmpeg/wasaploop children are
+// exempt from Windows background + EcoQoS throttling and can hold high scheduling priority,
+// so capturing a GPU-heavy foreground app (Discord) no longer starves the capture when the
+// Studio window loses focus — the root of the "breaks when I switch away" symptom. Relaunch
+// once with RunAs; the --elevated guard prevents a loop.
+if (process.platform === 'win32' && app.isPackaged && !process.argv.includes('--elevated')) {
+  let elevated = false;
+  try { require('child_process').execSync('net session', { stdio: 'ignore', windowsHide: true }); elevated = true; } catch {}
+  if (!elevated) {
+    try {
+      const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
+      const argList = [...process.argv.slice(1), '--elevated'].map(q).join(',');
+      require('child_process').spawnSync('powershell.exe', [
+        '-NoProfile', '-WindowStyle', 'Hidden', '-Command',
+        `$env:ELECTRON_RUN_AS_NODE=$null; Start-Process -FilePath ${q(process.execPath)} ` +
+          `-ArgumentList ${argList} -WorkingDirectory ${q(process.cwd())} -Verb RunAs`,
+      ], { stdio: 'ignore', windowsHide: true });
+    } catch {}
+    process.exit(0);
+  }
+}
+
 // ONE disable-features list — a second appendSwitch('disable-features') call silently
 // OVERWRITES this one and resurrects the WGC E_FAIL capture bug. Two bug classes killed here:
 // 1) WGC capture backend (ProcessFrame E_FAIL floods after display-config changes) — force
@@ -315,7 +337,10 @@ function spawnStream() {
         // passthrough (NOT cfr): keep ddagrab's true capture timestamps so audio stays
         // wall-clock-synced instead of being stretched to a strict 30fps clock the
         // capture can't sustain under GPU load — that stretch was the "shaky voice".
-        '-g', '60', '-fps_mode', 'passthrough',
+        '-fps_mode', 'passthrough',
+        // Keyframes by TIME (every 2s), not frame count — a frame-based GOP becomes a
+        // 6s+ keyframe interval if fps dips (YouTube: "keyframe frequency 6.0s" error).
+        '-force_key_frames', 'expr:gte(t,n_forced*2)', '-g', '60',
       ]
     : [
         '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency',
