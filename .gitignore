@@ -1,3 +1,9 @@
 node_modules/
 *.webm
 release/
+
+native/*.obj
+native/*.raw
+native/*.png
+native/size.txt
+native/pid.txt
