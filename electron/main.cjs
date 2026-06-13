@@ -317,8 +317,11 @@ function spawnStream() {
       sysGainDb: stream.sysGainDb,
     });
     useSysPipe = na.usePipe;
+    // Downscale to 1080p (keep aspect): a 1440p/4K desktop captured natively makes YouTube
+    // demand ~23500kbps; at the uplink-feasible ~6000kbps that looks blocky. Sharp 1080p
+    // is the right target. scale_qsv stays on-GPU (zero-copy).
     const vfilter = useQsv
-      ? 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]'
+      ? 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv,scale_qsv=w=-1:h=1080[v]'
       : `ddagrab=framerate=30,hwdownload,format=bgra,scale='min(1920,iw)':-2[v]`;
     const hw = useQsv ? ['-init_hw_device', 'd3d11va=dx', '-init_hw_device', 'qsv=qs@dx', '-filter_hw_device', 'dx'] : [];
     const fc = [vfilter, ...na.filterSegs].join(';');
