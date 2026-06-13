@@ -349,10 +349,11 @@ export function App() {
       const display = caps.find((c) => c.isScreen);
       if (display) await addSource(() => new ScreenSource(mixer.ctx, display.id, 'System audio', true, true));
     }
-    // 6800k = YouTube's exact 1080p recommendation; CBR pads to it, so the
-    // "bitrate lower than recommended" ingest warning stays silent.
+    // 4500k: within YouTube's 1080p30 range, and crucially it leaves the shared Intel
+    // iGPU enough headroom to capture (ddagrab) AND encode (QSV) at realtime on a busy
+    // desktop — 6800k drove the encoder below 1.0x (dup/drop, watchdog restarts).
     const err = await streamer.start(
-      compositor.captureStream(30), mixer.stream, url, key, 6800, directMode,
+      compositor.captureStream(30), mixer.stream, url, key, 4500, directMode,
       nativeMic, nativeMic && mic ? chains.get(mic.id)?.settings ?? null : null,
     );
     if (err) {

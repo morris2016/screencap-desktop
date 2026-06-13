@@ -243,6 +243,10 @@ export function YouTubePanel({ live, startStream, stopStream }: Props) {
           {/* ---- live: chat + moderation ---- */}
           {broadcast && (
             <>
+              <button className="add" style={{ background: '#1a73e8', color: '#fff' }}
+                onClick={() => window.screencap.openExternal(`https://www.youtube.com/watch?v=${broadcast.id}`)}>
+                ▶ Watch on YouTube ↗
+              </button>
               <button className="add" style={{ background: '#374151', color: '#fff' }} onClick={endBroadcast}>
                 ⏹ End broadcast
               </button>

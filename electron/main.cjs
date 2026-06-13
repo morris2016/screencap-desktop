@@ -377,12 +377,15 @@ function startWatchdog() {
     // ~15s (init cost amortizes in). Judging it before 20s kills healthy startups.
     if (Date.now() - stream.spawnMs < 20_000) return;
     const stalled = Date.now() - stream.lastProgressMs > 5_000;
-    if (stream.lastSpeed < 0.9) {
+    // Only restart for a SUSTAINED severe slowdown — a stream running slightly behind
+    // (0.8–0.95x) is still live and "Excellent" on YouTube's side; killing it thrashes
+    // the RTMP connection and makes things worse than just letting it run.
+    if (stream.lastSpeed < 0.8) {
       if (!stream.slowSinceMs) stream.slowSinceMs = Date.now();
     } else {
       stream.slowSinceMs = 0;
     }
-    const tooSlow = stream.slowSinceMs && Date.now() - stream.slowSinceMs > 10_000;
+    const tooSlow = stream.slowSinceMs && Date.now() - stream.slowSinceMs > 20_000;
     if (stalled || tooSlow) {
       try { stream.proc.kill(); } catch {}
       // close handler schedules the supervised restart

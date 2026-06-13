@@ -264,10 +264,13 @@ class YouTubeService {
     return { id: j.id, liveChatId: j.snippet.liveChatId, title: j.snippet.title };
   }
 
-  /** Reuse a persistent reusable stream so the key is stable; create one if none. */
+  /** Our OWN dedicated reusable stream (NOT YouTube's "Default stream", which collides
+   *  with the channel's built-in Stream-now and triggers "key currently assigned"). */
   async getOrCreateStream() {
-    const list = await this.apiFetch(`${API}/liveStreams?part=snippet,cdn,status&mine=true&maxResults=20`);
-    let s = (list.items || []).find((x) => x.contentDetails?.isReusable !== false && x.cdn?.ingestionInfo?.streamName);
+    const list = await this.apiFetch(`${API}/liveStreams?part=snippet,cdn,status&mine=true&maxResults=50`);
+    let s = (list.items || []).find(
+      (x) => x.snippet?.title === 'ScreenCap Studio' && x.cdn?.ingestionInfo?.streamName,
+    );
     if (!s) {
       s = await this.apiFetch(`${API}/liveStreams?part=snippet,cdn,contentDetails`, {
         method: 'POST',
@@ -340,7 +343,11 @@ class YouTubeService {
     const all = await this._listNonComplete();
     for (const b of all) {
       if (b.id === exceptId) continue;
-      if (b.contentDetails?.boundStreamId !== streamId) continue;
+      // Clean up anything bound to our stream OR any leftover broadcast this app created
+      // (title match) — clears the pile from earlier attempts regardless of stream.
+      const boundToUs = b.contentDetails?.boundStreamId === streamId;
+      const ours = b.snippet?.title === 'ScreenCap Studio Live';
+      if (!boundToUs && !ours) continue;
       const lc = b.status?.lifeCycleStatus;
       try {
         if (lc === 'live' || lc === 'liveStarting') await this.transition(b.id, 'complete');
