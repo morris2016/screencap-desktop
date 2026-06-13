@@ -33,6 +33,7 @@ class YouTubeService {
     this.accessExpiry = 0;
     this.channel = null; // { id, title }
     this.chat = null; // active poll loop state
+    this.serverSkewMs = 0; // (server clock − local clock); the local clock can't be trusted
     this._load();
   }
 
@@ -150,6 +151,16 @@ class YouTubeService {
     this.accessExpiry = Date.now() + (tok.expires_in - 60) * 1000; // 60s safety margin
   }
 
+  // The local clock is wrong relative to Google (this machine runs in the future). Derive
+  // a true "now" from the server's Date header so scheduledStartTime is valid.
+  _captureSkew(r) {
+    const d = r.headers.get('date');
+    if (d) { const t = Date.parse(d); if (!isNaN(t)) this.serverSkewMs = t - Date.now(); }
+  }
+  serverNow() {
+    return Date.now() + this.serverSkewMs;
+  }
+
   async _tokenRequest(extra) {
     const body = new URLSearchParams({ client_id: this.clientId, client_secret: this.clientSecret, ...extra });
     const r = await fetch(TOKEN_URL, {
@@ -157,6 +168,7 @@ class YouTubeService {
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: body.toString(),
     });
+    this._captureSkew(r);
     const j = await r.json();
     if (!r.ok) throw new Error(j.error_description || j.error || `token ${r.status}`);
     return j;
@@ -185,6 +197,7 @@ class YouTubeService {
       await new Promise((res) => setTimeout(res, 500 * 2 ** _retry));
       return this.apiFetch(url, opts, _retry + 1);
     }
+    this._captureSkew(r);
     const text = await r.text();
     const j = text ? JSON.parse(text) : {};
     if (!r.ok) {
@@ -221,11 +234,15 @@ class YouTubeService {
   }
 
   async createBroadcast({ title, description, privacy, scheduledStartTime, latency }) {
+    // Refresh server skew right before building the body (cheap, ~1 quota unit). The local
+    // clock is in the future, so scheduledStartTime MUST be derived from the server's clock.
+    try { await this._fetchChannel(); } catch {}
     const body = {
       snippet: {
         title: title || 'ScreenCap Studio Live',
         description: description || '',
-        scheduledStartTime: scheduledStartTime || new Date(Date.now() + 60_000).toISOString(),
+        // "Now + 30s" on the SERVER clock — instant go-live, valid against YouTube's date.
+        scheduledStartTime: scheduledStartTime || new Date(this.serverNow() + 30_000).toISOString(),
       },
       status: { privacyStatus: privacy || 'unlisted', selfDeclaredMadeForKids: false },
       contentDetails: {
