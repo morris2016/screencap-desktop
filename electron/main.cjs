@@ -13,16 +13,20 @@ if (process.platform === 'win32' && app.isPackaged && !process.argv.includes('--
   let elevated = false;
   try { require('child_process').execSync('net session', { stdio: 'ignore', windowsHide: true }); elevated = true; } catch {}
   if (!elevated) {
+    let relaunched = false;
     try {
       const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
       const argList = [...process.argv.slice(1), '--elevated'].map(q).join(',');
-      require('child_process').spawnSync('powershell.exe', [
+      const r = require('child_process').spawnSync('powershell.exe', [
         '-NoProfile', '-WindowStyle', 'Hidden', '-Command',
         `$env:ELECTRON_RUN_AS_NODE=$null; Start-Process -FilePath ${q(process.execPath)} ` +
-          `-ArgumentList ${argList} -WorkingDirectory ${q(process.cwd())} -Verb RunAs`,
+          `-ArgumentList ${argList} -WorkingDirectory ${q(process.cwd())} -Verb RunAs -ErrorAction Stop`,
       ], { stdio: 'ignore', windowsHide: true });
+      relaunched = r.status === 0; // UAC accepted → elevated instance launched
     } catch {}
-    process.exit(0);
+    // Only hand off if the elevated copy actually started; otherwise (UAC declined / no
+    // PowerShell) keep running non-elevated so the app always opens.
+    if (relaunched) process.exit(0);
   }
 }
 
