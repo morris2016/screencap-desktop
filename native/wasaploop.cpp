@@ -13,8 +13,7 @@
 #include <audioclient.h>
 #include <audioclientactivationparams.h>
 #include <mmreg.h>
-#include <mfapi.h>
-#include <roapi.h>
+#include <wrl/implements.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <io.h>
@@ -22,28 +21,15 @@
 
 #define REFTIMES_PER_SEC 10000000
 
-// ---- async activation completion handler. MUST be agile (aggregate a free-threaded
-// marshaler) or ActivateAudioInterfaceAsync fails with E_ILLEGAL_METHOD_CALL. ----
-class ActivateHandler : public IActivateAudioInterfaceCompletionHandler {
-    long ref = 1;
-    IUnknown* ftm = NULL;
+using namespace Microsoft::WRL;
+
+// Async activation completion handler. FtmBase makes it AGILE (free-threaded marshaler +
+// IAgileObject) — without that ActivateAudioInterfaceAsync fails E_ILLEGAL_METHOD_CALL.
+class ActivateHandler
+    : public RuntimeClass<RuntimeClassFlags<ClassicCom>, FtmBase, IActivateAudioInterfaceCompletionHandler> {
 public:
-    HANDLE done;
-    ActivateHandler() {
-        done = CreateEvent(NULL, FALSE, FALSE, NULL);
-        CoCreateFreeThreadedMarshaler(static_cast<IActivateAudioInterfaceCompletionHandler*>(this), &ftm);
-    }
-    ~ActivateHandler() { if (ftm) ftm->Release(); }
-    STDMETHOD(ActivateCompleted)(IActivateAudioInterfaceAsyncOperation*) { SetEvent(done); return S_OK; }
-    STDMETHOD(QueryInterface)(REFIID riid, void** ppv) {
-        if (riid == __uuidof(IUnknown) || riid == __uuidof(IActivateAudioInterfaceCompletionHandler)) {
-            *ppv = static_cast<IActivateAudioInterfaceCompletionHandler*>(this); AddRef(); return S_OK;
-        }
-        if (riid == __uuidof(IMarshal) && ftm) return ftm->QueryInterface(riid, ppv);
-        *ppv = NULL; return E_NOINTERFACE;
-    }
-    STDMETHOD_(ULONG, AddRef)() { return InterlockedIncrement(&ref); }
-    STDMETHOD_(ULONG, Release)() { long r = InterlockedDecrement(&ref); if (!r) delete this; return r; }
+    HANDLE done = CreateEvent(NULL, FALSE, FALSE, NULL);
+    STDMETHOD(ActivateCompleted)(IActivateAudioInterfaceAsyncOperation*) override { SetEvent(done); return S_OK; }
 };
 
 static void fixedFloatFormat(WAVEFORMATEX* f) {
@@ -83,10 +69,10 @@ static IAudioClient* processClient(DWORD pid, WAVEFORMATEX* fmt) {
     pv.blob.cbSize = sizeof(ap);
     pv.blob.pBlobData = (BYTE*)&ap;
 
-    ActivateHandler* h = new ActivateHandler();
+    ComPtr<ActivateHandler> h = Make<ActivateHandler>();
     IActivateAudioInterfaceAsyncOperation* op = NULL;
     HRESULT hr = ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
-            __uuidof(IAudioClient), &pv, h, &op);
+            __uuidof(IAudioClient), &pv, h.Get(), &op);
     if (FAILED(hr)) { fprintf(stderr, "activate-async 0x%08lx\n", hr); return NULL; }
     WaitForSingleObject(h->done, 5000);
     HRESULT ar = E_FAIL; IUnknown* unk = NULL;
