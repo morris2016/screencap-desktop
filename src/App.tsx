@@ -356,12 +356,11 @@ export function App() {
       const display = caps.find((c) => c.isScreen);
       if (display) await addSource(() => new ScreenSource(mixer.ctx, display.id, 'System audio', true, true));
     }
-    // 4500k: within YouTube's 1080p30 range, and crucially it leaves the shared Intel
-    // iGPU enough headroom to capture (ddagrab) AND encode (QSV) at realtime on a busy
-    // desktop — 6800k drove the encoder below 1.0x (dup/drop, watchdog restarts).
+    // 6000k for crisp 1080p — bitrate doesn't affect the capture-bound speed (verified:
+    // 720p, 1080p and 20fps all ~0.96x), so there's no stability reason to starve quality.
     streamIsNative.current = !!nativeMic;
     const err = await streamer.start(
-      compositor.captureStream(30), mixer.stream, url, key, 4500, directMode,
+      compositor.captureStream(30), mixer.stream, url, key, 6000, directMode,
       nativeMic, nativeMic && mic ? chains.get(mic.id)?.settings ?? null : null,
     );
     if (err) {

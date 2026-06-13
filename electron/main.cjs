@@ -192,7 +192,10 @@ function sendAll(channel, ...args) {
 function voiceChainFilter(fx) {
   const f = fx || {};
   const num = (v, d) => (typeof v === 'number' && isFinite(v) ? v : d);
-  const parts = ['aresample=async=1000:first_pts=0'];
+  // Gentle wall-clock sync: async=1 with a 100ms hard-comp floor keeps audio locked to
+  // its true capture time and only nudges on large drift — NOT the aggressive async=1000
+  // stretch that broke the voice when video ran a few % under realtime (capture-bound).
+  const parts = ['aresample=async=1:min_hard_comp=0.100:first_pts=0'];
   const trim = num(f.inputDb, 0);
   if (trim) parts.push(`volume=${trim}dB`);
   parts.push(`highpass=f=${num(f.lowCut, 80)}:poles=2`);
@@ -265,10 +268,13 @@ function spawnStream() {
     : ['-fflags', 'nobuffer', '-i', 'pipe:0'];
   const videoEnc = useQsv
     ? [
-        '-c:v', 'h264_qsv', '-preset', 'fast',
+        '-c:v', 'h264_qsv', '-preset', 'veryfast',
         '-b:v', `${stream.bitrateK}k`, '-maxrate', `${stream.bitrateK}k`,
         '-bufsize', `${stream.bitrateK * 2}k`,
-        '-g', '60', '-fps_mode', 'cfr',
+        // passthrough (NOT cfr): keep ddagrab's true capture timestamps so audio stays
+        // wall-clock-synced instead of being stretched to a strict 30fps clock the
+        // capture can't sustain under GPU load — that stretch was the "shaky voice".
+        '-g', '60', '-fps_mode', 'passthrough',
       ]
     : [
         '-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency',
@@ -474,7 +480,7 @@ ipcMain.handle('native-record-start', (e, micDevice, fx) => {
       : []),
     '-map', '[v]', ...(micDevice ? ['-map', '0:a'] : []),
     '-c:v', 'h264_qsv', '-preset', 'fast', '-b:v', '8000k', '-maxrate', '8000k',
-    '-bufsize', '16000k', '-g', '60', '-fps_mode', 'cfr',
+    '-bufsize', '16000k', '-g', '60', '-fps_mode', 'passthrough',
     ...(micDevice ? ['-af', voiceChainFilter(fx), '-c:a', 'aac', '-b:a', '192k', '-ar', '48000'] : []),
     '-y', nrec.tmp,
   ]);
