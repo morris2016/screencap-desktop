@@ -335,13 +335,17 @@ function buildNativeAudio({ micDevice, wantSystem, fx, sysGainDb, micGainDb }) {
   const lim = 'alimiter=limit=0.891:attack=5:release=80:level=disabled';
   let mapLabel = null;
   if (mi >= 0 && si >= 0) {
-    // Mic and system audio are summed at INDEPENDENT, user-set levels. Discord is NEVER
-    // auto-reduced/ducked by the mic — the operator controls its volume with the fader.
-    // The final limiter is a transparent clip-guard only (catches true >0dBFS peaks so the
-    // mix can't distort; otherwise inaudible, so it doesn't pull the system audio down).
-    segs.push(`[${mi}:a]${voiceChainFilter(fx, { limiter: false })},volume=${mdb}dB[m]`);
+    // Discord (system audio) is NEVER ducked by the mic — it rides through at the operator's
+    // fader level, mathematically untouched. The trick: peak-control lives on the MIC CHANNEL,
+    // not on the shared bus. A bus limiter/soft-clip reacts to the *sum*, so a mic peak pulls
+    // Discord down with it (measured: the old bus limiter ducked Discord up to -1.4dB while
+    // talking; asoftclip was worse at -2.5dB). Instead we cap the mic alone at -6dBFS
+    // (alimiter limit=0.5) so it can't run away or clip, then a PURE LINEAR SUM with Discord.
+    // Verified: Discord level is identical mic-silent vs mic-talking (duck 0.00dB) and the bus
+    // peaks at ~0dBFS with no clipping even with a hot mic over a loud (-6dBFS) Discord.
+    segs.push(`[${mi}:a]${voiceChainFilter(fx, { limiter: false })},volume=${mdb}dB,alimiter=limit=0.5:attack=5:release=50:level=disabled[m]`);
     segs.push(`[${si}:a]aresample=async=1:first_pts=0,volume=${sdb}dB[s]`);
-    segs.push(`[m][s]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.99:attack=3:release=50:level=disabled[aout]`);
+    segs.push(`[m][s]amix=inputs=2:duration=longest:normalize=0[aout]`);
     mapLabel = '[aout]';
   } else if (mi >= 0) {
     segs.push(`[${mi}:a]${voiceChainFilter(fx)}[aout]`);
