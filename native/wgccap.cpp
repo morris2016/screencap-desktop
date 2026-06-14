@@ -22,6 +22,8 @@
 #include <fcntl.h>
 #include <mutex>
 #include <vector>
+#include <timeapi.h>
+#pragma comment(lib, "winmm.lib")
 
 using namespace winrt;
 using namespace winrt::Windows::Graphics;
@@ -35,6 +37,7 @@ static int g_w = 0, g_h = 0;
 
 int main(int argc, char** argv) {
     _setmode(_fileno(stdout), _O_BINARY);
+    timeBeginPeriod(1); // 1ms timer granularity → precise frame pacing (default 15.6ms capped fps to ~0.98x)
     if (argc < 2) { fprintf(stderr, "usage: wgccap <hwnd>\n"); return 1; }
     HWND hwnd = (HWND)(intptr_t)strtoull(argv[1], nullptr, 10);
     if (!IsWindow(hwnd)) { fprintf(stderr, "WGC bad hwnd\n"); return 2; }
@@ -43,6 +46,12 @@ int main(int argc, char** argv) {
     // generation, power-of-2) and only pipe the smaller frame. 3840x2160 -> 1920x1080 = mip 1.
     int maxH = (argc > 2) ? atoi(argv[2]) : 1080;
     if (maxH < 120) maxH = 120;
+    // Output/processing frame rate. WGC delivers frames at the window's change rate (a video
+    // call can push 60/s), and each one costs a 4K GPU downscale + CPU readback. Throttling the
+    // EXPENSIVE work to this rate is the main lever for keeping a live encode realtime on a
+    // shared iGPU. 30 for recording; lower (e.g. 24) for streaming headroom.
+    int fps = (argc > 3) ? atoi(argv[3]) : 30;
+    if (fps < 5) fps = 5; if (fps > 60) fps = 60;
 
     init_apartment(apartment_type::multi_threaded);
 
@@ -109,9 +118,18 @@ int main(int argc, char** argv) {
     auto session = pool.CreateCaptureSession(item);
     try { session.IsCursorCaptureEnabled(true); } catch (...) {}
 
+    // Throttle the expensive per-frame work (4K downscale + readback) to `fps`. Frames that
+    // arrive sooner are still dequeued (so the pool can't back up) but dropped without processing.
+    LARGE_INTEGER qfreq; QueryPerformanceFrequency(&qfreq);
+    const LONGLONG minTicks = qfreq.QuadPart / fps;
+    LARGE_INTEGER lastProc = { 0 };
+
     pool.FrameArrived([&](Direct3D11CaptureFramePool const& p, winrt::Windows::Foundation::IInspectable const&) {
         auto frame = p.TryGetNextFrame();
         if (!frame) return;
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        if (lastProc.QuadPart && (now.QuadPart - lastProc.QuadPart) < minTicks) return; // throttled: drop
+        lastProc = now;
         auto access = frame.Surface().as<::Windows::Graphics::DirectX::Direct3D11::IDirect3DDxgiInterfaceAccess>();
         com_ptr<ID3D11Texture2D> src;
         if (FAILED(access->GetInterface(guid_of<ID3D11Texture2D>(), src.put_void()))) return;
@@ -141,7 +159,7 @@ int main(int argc, char** argv) {
     std::vector<BYTE> out((size_t)outW * outH * 4, 0);
     LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
     LARGE_INTEGER next; QueryPerformanceCounter(&next);
-    const double frameTicks = (double)freq.QuadPart / 30.0;
+    const double frameTicks = (double)freq.QuadPart / (double)fps;
     for (;;) {
         { std::lock_guard<std::mutex> lk(g_mtx); memcpy(out.data(), g_latest.data(), out.size()); }
         if (fwrite(out.data(), 1, out.size(), stdout) != out.size()) break; // ffmpeg closed
@@ -150,7 +168,9 @@ int main(int argc, char** argv) {
         LARGE_INTEGER now; QueryPerformanceCounter(&now);
         double ms = (double)(next.QuadPart - now.QuadPart) * 1000.0 / freq.QuadPart;
         if (ms > 0) Sleep((DWORD)ms);
-        else { QueryPerformanceCounter(&next); }
+        // Behind schedule: loop immediately to catch up (don't drop the deficit). Only hard-
+        // resync if hopelessly behind (>2 frames) to avoid a runaway burst.
+        else if ((now.QuadPart - next.QuadPart) > (LONGLONG)(2 * frameTicks)) next = now;
     }
     return 0;
 }

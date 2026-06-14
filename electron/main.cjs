@@ -200,6 +200,11 @@ const stream = {
   sysGainDb: 0,         // system-audio level trim in dB (operator-controlled)
   micGainDb: 0,         // mic level trim in dB (operator-controlled, post voice chain)
   sysProcs: [],         // the wasaploop children feeding system audio into ffmpeg stdin
+  windowHwnd: 0,        // WINDOW-CAPTURE MODE: share only this window (wgccap video + its app audio)
+  windowPid: 0,         // owning PID of the shared window → wasaploop per-app audio
+  winProcs: [],         // wgccap child(ren) feeding window video into ffmpeg stdin
+  winPipe: null,        // named-pipe server carrying the window app's audio
+  winEnc: 'nvenc',      // window-stream encoder ladder: nvenc → qsv → x264
   fx: null,             // VoiceFx settings from the renderer → ffmpeg filter chain
   qsvBroken: false,     // QuickSync failed this session — fall back to libx264
   spawnMs: 0,           // watchdog startup-grace anchor
@@ -357,14 +362,18 @@ function spawnWindowVideo(hwnd, maxH, cb) {
 // Build the ffmpeg input/filter/map for WINDOW-capture mode: video = wgccap rawvideo on stdin
 // (input 0), mic = dshow (input 1), per-app system audio = f32le named pipe (input 2). Mic peak
 // control stays on the mic channel; system app audio rides through at unity (no cross-duck).
-function windowFfmpegAV({ W, H, micDevice, fx, sysPipePath, useQsv }) {
+function windowFfmpegAV({ W, H, micDevice, fx, sysPipePath, encoder }) {
   const inputs = ['-f', 'rawvideo', '-pixel_format', 'bgra', '-video_size', `${W}x${H}`, '-framerate', '30', '-thread_queue_size', '64', '-i', 'pipe:0'];
   let mi = -1, si = -1, n = 1;
   if (micDevice) { inputs.push('-f', 'dshow', '-audio_buffer_size', '80', '-thread_queue_size', '4096', '-rtbufsize', '64M', '-i', `audio=${micDevice}`); mi = n++; }
   if (sysPipePath) { inputs.push('-f', 'f32le', '-ar', '48000', '-ac', '2', '-thread_queue_size', '4096', '-i', sysPipePath); si = n++; }
-  const vseg = useQsv
-    ? `[0:v]scale=-2:'min(1080,ih)',format=nv12,hwupload[v]`
-    : `[0:v]scale=-2:'min(1080,ih)',format=yuv420p[v]`;
+  // Encoder picks the upload + device. NVENC offloads scale+encode to the NVIDIA GPU so the
+  // Intel iGPU is left free for wgccap capture (the window path otherwise overloads one iGPU
+  // with capture+downscale+readback+encode and falls below realtime under app load).
+  let hw, vseg;
+  if (encoder === 'nvenc') { hw = ['-init_hw_device', 'cuda=cu', '-filter_hw_device', 'cu']; vseg = `[0:v]scale=-2:'min(1080,ih)',format=nv12,hwupload_cuda[v]`; }
+  else if (encoder === 'qsv') { hw = ['-init_hw_device', 'qsv=qs', '-filter_hw_device', 'qs']; vseg = `[0:v]scale=-2:'min(1080,ih)',format=nv12,hwupload[v]`; }
+  else { hw = []; vseg = `[0:v]scale=-2:'min(1080,ih)',format=yuv420p[v]`; }
   const aseg = [];
   let amap = null;
   if (mi >= 0 && si >= 0) {
@@ -374,8 +383,22 @@ function windowFfmpegAV({ W, H, micDevice, fx, sysPipePath, useQsv }) {
     amap = '[aout]';
   } else if (mi >= 0) { aseg.push(`[${mi}:a]${voiceChainFilter(fx)}[aout]`); amap = '[aout]'; }
   else if (si >= 0) { aseg.push(`[${si}:a]aresample=async=1:first_pts=0[aout]`); amap = '[aout]'; }
-  const hw = useQsv ? ['-init_hw_device', 'qsv=qs', '-filter_hw_device', 'qs'] : [];
   return { hw, inputs, fc: [vseg, ...aseg].join(';'), maps: ['-map', '[v]', ...(amap ? ['-map', amap] : [])], hasAudio: !!amap };
+}
+
+// Video encoder args for window mode. forStream adds CBR + 2s time-based keyframes (YouTube).
+function windowVenc(encoder, bitrateK, forStream) {
+  const br = `${bitrateK}k`;
+  if (encoder === 'nvenc') {
+    return ['-c:v', 'h264_nvenc', '-preset', 'p4', '-rc', 'cbr', '-b:v', br, '-maxrate', br, '-bufsize', `${bitrateK * 2}k`,
+      ...(forStream ? ['-forced-idr', '1', '-force_key_frames', 'expr:gte(t,n_forced*2)'] : []), '-g', '60'];
+  }
+  if (encoder === 'qsv') {
+    return ['-c:v', 'h264_qsv', '-preset', 'veryfast', '-b:v', br, '-maxrate', br, '-bufsize', `${bitrateK * 2}k`,
+      ...(forStream ? ['-force_key_frames', 'expr:gte(t,n_forced*2)'] : []), '-g', '60'];
+  }
+  return ['-c:v', 'libx264', '-preset', 'superfast', '-tune', 'zerolatency', '-threads', '4',
+    '-b:v', br, '-minrate', br, '-maxrate', br, '-bufsize', `${bitrateK * 2}k`, '-x264-params', 'nal-hrd=cbr', '-g', '60', '-keyint_min', '60', '-pix_fmt', 'yuv420p'];
 }
 
 /**
@@ -426,7 +449,10 @@ function spawnStream() {
   const { spawn } = require('child_process');
   const ff = ffmpegPath();
   const logPath = path.join(app.getPath('temp'), 'screencap-studio-stream.log');
-  let recentErr = [];
+  stopSysAudio(); // clean slate: kill any feeders from a previous (re)spawn
+  // WINDOW-CAPTURE MODE: stream ONLY the chosen window (wgccap video + that app's audio + mic),
+  // not the whole screen. Async (reads the window size first) → shares finishStreamSpawn below.
+  if (stream.direct && stream.windowHwnd && wgccapPath()) { spawnStreamWindow(ff, logPath); return; }
   // Direct mode: video is captured NATIVELY by ffmpeg (Desktop Duplication API via ddagrab)
   // and only mixer audio rides the pipe — Chromium's flaky WGC capture is out of the video
   // path entirely. Default mode: full A/V MediaRecorder stream over the pipe (scene compositing).
@@ -492,19 +518,52 @@ function spawnStream() {
     ...audioOut,
     '-f', 'flv', stream.target,
   ]);
+  finishStreamSpawn(p, useQsv, logPath, () => {
+    // System audio: pipe the native WASAPI loopback capturer into ffmpeg's stdin.
+    // One capturer per selected app (clean, per-app), mixed in Node → ffmpeg stdin; [] = all.
+    if (useSysPipe) stream.sysProcs = spawnSysAudio(stream.systemPids, p.stdin);
+  });
+}
+
+// Stream ONLY one window: wgccap captures that HWND's pixels (scoped even when occluded) → the
+// 1080p-downscaled raw video rides ffmpeg's stdin; the window app's audio (wasaploop of its PID)
+// rides a named pipe; the mic is dshow. Async because the window size must be read first.
+function spawnStreamWindow(ff, logPath) {
+  const { spawn } = require('child_process');
+  const enc = stream.winEnc || 'nvenc'; // NVENC (NVIDIA) keeps encode OFF the capture iGPU
+  spawnWindowVideo(stream.windowHwnd, 1080, (err, wg, W, H) => {
+    if (err || !wg) {
+      try { wg && wg.kill(); } catch {}
+      if (stream.wanted) scheduleRestart('window capture unavailable');
+      else sendAll('stream-ended', -1, 'window capture unavailable');
+      return;
+    }
+    const pipe = stream.windowPid > 0 ? serveSysAudioPipe([stream.windowPid]) : null;
+    const av = windowFfmpegAV({ W, H, micDevice: stream.micDevice, fx: stream.fx, sysPipePath: pipe && pipe.pipePath, encoder: enc });
+    const venc = windowVenc(enc, stream.bitrateK, true);
+    const p = spawn(ff, [...av.hw, ...av.inputs, '-filter_complex', av.fc, ...av.maps, ...venc,
+      ...(av.hasAudio ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000'] : []),
+      '-fps_mode', 'passthrough', '-f', 'flv', stream.target], { stdio: ['pipe', 'ignore', 'pipe'] });
+    p.winEncoder = enc; // for the encoder-fallback ladder in finishStreamSpawn
+    stream.winProcs = [wg]; stream.winPipe = pipe;
+    wg.stdout.on('error', () => {});
+    wg.stdout.pipe(p.stdin);
+    finishStreamSpawn(p, false, logPath, null); // feeders (wgccap→stdin, pipe) already wired
+  });
+}
+
+// Shared supervisor for a freshly-spawned streaming ffmpeg: priority, health parsing, and the
+// QSV-fallback / supervised-restart close handler. wireInputs() (if given) attaches this proc's
+// audio feeders; window mode wires its own before calling and passes null.
+function finishStreamSpawn(p, useQsv, logPath, wireInputs) {
+  let recentErr = [];
   p.usedQsv = useQsv;
   stream.proc = p;
-  // System audio: pipe the native WASAPI loopback capturer into ffmpeg's stdin.
-  stopSysAudio();
-  if (useSysPipe) {
-    // One capturer per selected app (clean, per-app), mixed in Node → ffmpeg stdin; [] = all.
-    stream.sysProcs = spawnSysAudio(stream.systemPids, p.stdin);
-  }
-  // Priority by mode. NATIVE mode: ffmpeg IS the capture+encode+audio, so it must run
-  // HIGH — otherwise Windows background-throttles our process the instant the app loses
-  // foreground, the ddagrab grab collapses to ~0.5x, and the audio shreds (field bug:
-  // "clean when focused, breaks when I switch away"). PIPE mode: the renderer's audio
-  // engine is the critical path, so keep ffmpeg below-normal to not preempt it.
+  if (wireInputs) wireInputs();
+  // Priority by mode. NATIVE mode: ffmpeg IS the capture+encode+audio, so it must run HIGH —
+  // otherwise Windows background-throttles it the instant the app loses foreground and the
+  // capture collapses (field bug: "clean when focused, breaks when I switch away"). PIPE mode:
+  // the renderer's audio engine is the critical path, so keep ffmpeg below-normal.
   try {
     const os = require('os');
     os.setPriority(p.pid, stream.direct ? os.constants.priority.PRIORITY_HIGH : os.constants.priority.PRIORITY_BELOW_NORMAL);
@@ -545,9 +604,18 @@ function spawnStream() {
   p.on('close', (code) => {
     if (stream.proc !== p) return;
     stream.proc = null;
+    stopSysAudio(); // kill this proc's audio/video feeders before any respawn
     const reason = recentErr
       .filter((l) => /error|fail|refused|denied|not found|Invalid|I\/O/i.test(l))
       .slice(-2).join(' | ');
+    // Window-mode encoder died on arrival: step down the ladder nvenc → qsv → x264 without
+    // consuming a restart attempt (NVENC may be absent/busy; QSV is the iGPU fallback).
+    if (stream.wanted && p.winEncoder && Date.now() - stream.spawnMs < 3_000 && p.winEncoder !== 'x264') {
+      stream.winEnc = p.winEncoder === 'nvenc' ? 'qsv' : 'x264';
+      spawnStream();
+      sendAll('stream-resume');
+      return;
+    }
     // QSV died on arrival (bad driver/no iGPU): flip to the x264 path immediately,
     // without consuming a supervised-restart attempt.
     if (stream.wanted && p.usedQsv && Date.now() - stream.spawnMs < 3_000) {
@@ -618,6 +686,9 @@ function stopWatchdog() {
 function stopSysAudio() {
   for (const p of stream.sysProcs) { try { p.kill(); } catch {} }
   stream.sysProcs = [];
+  for (const w of stream.winProcs || []) { try { w.kill(); } catch {} }
+  stream.winProcs = [];
+  if (stream.winPipe) { try { stream.winPipe.kill(); } catch {} stream.winPipe = null; }
 }
 
 ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx, audio) => {
@@ -635,6 +706,9 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx, au
   stream.systemPids = (audio && Array.isArray(audio.systemPids)) ? audio.systemPids.map(Number).filter(Boolean) : [];
   stream.sysGainDb = (audio && typeof audio.sysGainDb === 'number') ? audio.sysGainDb : 0;
   stream.micGainDb = (audio && typeof audio.micGainDb === 'number') ? audio.micGainDb : 0;
+  stream.windowHwnd = (direct && audio && Number(audio.windowHwnd)) || 0; // window-capture mode
+  stream.windowPid = (audio && Number(audio.windowPid)) || 0;
+  stream.winEnc = 'nvenc'; // window encoder ladder start: NVIDIA NVENC (off the capture iGPU)
   stream.qsvBroken = false; // re-probe QuickSync each go-live
   stream.wanted = true;
   stream.attempts = 0;
@@ -703,10 +777,9 @@ ipcMain.handle('native-record-start', async (e, micDevice, fx, audio) => {
         spawnWindowVideo(windowHwnd, 1080, (err, wg, W, H) => {
           if (err || !wg) { try { wg && wg.kill(); } catch {} if (!resolved) { resolved = true; resolve({ ok: false, error: 'window capture unavailable' }); } return; }
           const pipe = windowPid > 0 ? serveSysAudioPipe([windowPid]) : null;
-          const av = windowFfmpegAV({ W, H, micDevice, fx, sysPipePath: pipe && pipe.pipePath, useQsv });
-          const venc = useQsv
-            ? ['-c:v', 'h264_qsv', '-preset', 'veryfast', '-b:v', '8000k', '-maxrate', '8000k', '-bufsize', '16000k', '-g', '60']
-            : ['-c:v', 'libx264', '-preset', 'superfast', '-pix_fmt', 'yuv420p', '-b:v', '8000k', '-g', '60'];
+          const recEnc = useQsv ? 'qsv' : 'x264';
+          const av = windowFfmpegAV({ W, H, micDevice, fx, sysPipePath: pipe && pipe.pipePath, encoder: recEnc });
+          const venc = windowVenc(recEnc, 8000, false);
           const p = spawn(ff, [...av.hw, ...av.inputs, '-filter_complex', av.fc, ...av.maps,
             ...venc, ...(av.hasAudio ? ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000'] : []),
             '-fps_mode', 'passthrough', '-y', nrec.tmp], { stdio: ['pipe', 'ignore', 'pipe'] });

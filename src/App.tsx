@@ -409,7 +409,7 @@ export function App() {
     // WASAPI loopback, wasaploop.exe) and mixes them in-filter. No Chromium in the live
     // path → immune to renderer/occlusion throttling (the switch-away breaking).
     const nat = await nativeAudioPlan();
-    streamIsNative.current = directMode && (!!nat.micDevice || nat.audio.system);
+    streamIsNative.current = directMode && (!!nat.micDevice || nat.audio.system || !!nat.audio.windowHwnd);
     const err = await streamer.start(
       compositor.captureStream(30), mixer.stream, url, key, 6000, directMode,
       nat.micDevice, nat.fx, nat.audio,
