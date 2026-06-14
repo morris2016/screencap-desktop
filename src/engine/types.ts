@@ -118,9 +118,21 @@ export interface NativeAudioOpts {
   sysGainDb?: number;
   /** Mic level trim in dB — operator-controlled. */
   micGainDb?: number;
+  /** WINDOW-CAPTURE MODE: share exactly one window. Video = wgccap of this HWND, audio = this
+   * window's PID (wasaploop) + mic. Set both to scope video AND audio to one app. */
+  windowHwnd?: number;
+  windowPid?: number;
 }
 
 export interface AudioApp {
+  pid: number;
+  name: string;
+  title: string;
+}
+
+/** A top-level window for "share one window" mode (HWND for video + PID for per-app audio). */
+export interface CaptureWindow {
+  hwnd: number;
   pid: number;
   name: string;
   title: string;
@@ -159,6 +171,7 @@ declare global {
       sessionActive(on: boolean): void;
       openExternal(url: string): Promise<void>;
       listAudioApps(): Promise<AudioApp[]>;
+      listWindows(): Promise<CaptureWindow[]>;
       nativeRecordStart(micDevice: string | null, fx: unknown, audio: NativeAudioOpts): Promise<{ ok: boolean; error?: string }>;
       nativeRecordStop(): Promise<string | null>;
       onNativeRecordFailed(cb: () => void): void;

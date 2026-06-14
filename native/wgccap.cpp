@@ -38,6 +38,11 @@ int main(int argc, char** argv) {
     if (argc < 2) { fprintf(stderr, "usage: wgccap <hwnd>\n"); return 1; }
     HWND hwnd = (HWND)(intptr_t)strtoull(argv[1], nullptr, 10);
     if (!IsWindow(hwnd)) { fprintf(stderr, "WGC bad hwnd\n"); return 2; }
+    // Optional max output height (default 1080). A 4K window piped as raw BGRA is ~950MB/s and
+    // can't be scaled+encoded in realtime downstream, so we downscale ON THE GPU here (via mip
+    // generation, power-of-2) and only pipe the smaller frame. 3840x2160 -> 1920x1080 = mip 1.
+    int maxH = (argc > 2) ? atoi(argv[2]) : 1080;
+    if (maxH < 120) maxH = 120;
 
     init_apartment(apartment_type::multi_threaded);
 
@@ -63,12 +68,36 @@ int main(int argc, char** argv) {
     auto isz = item.Size();
     g_w = isz.Width; g_h = isz.Height;
     if (g_w <= 0 || g_h <= 0) { g_w = 1280; g_h = 720; }
-    fprintf(stderr, "WGC_SIZE w=%d h=%d\n", g_w, g_h); fflush(stderr);
-    g_latest.assign((size_t)g_w * g_h * 4, 0);
 
-    // Fixed-size CPU-readable staging texture; frames are copied here then read out.
+    // Pick a power-of-2 GPU downscale so the EMITTED height lands near maxH (a touch over is
+    // fine — ffmpeg does the final exact scale cheaply once the frame is small). Halving whenever
+    // the window is >~25% taller than the target keeps the raw pipe + encode realtime:
+    //   2160->1080, 1994->997, 1440->720, 1080->1080. Downsample is on the GPU via GenerateMips.
+    int factor = 1;
+    while (factor < 4 && (g_h / factor) > maxH * 5 / 4) factor *= 2;
+    int outW = (g_w / factor) & ~1;   // keep even (yuv420p downstream)
+    int outH = (g_h / factor) & ~1;
+    int outMip = (factor == 4) ? 2 : (factor == 2) ? 1 : 0;
+    int mipLevels = outMip + 1;
+    fprintf(stderr, "WGC_SIZE w=%d h=%d\n", outW, outH); fflush(stderr);
+    g_latest.assign((size_t)outW * outH * 4, 0);
+
+    // Intermediate mippable texture: captured frame copied into mip 0, GenerateMips builds the
+    // smaller mips on the GPU, then the target mip is copied into the CPU-readable staging.
+    D3D11_TEXTURE2D_DESC md = {};
+    md.Width = g_w; md.Height = g_h; md.MipLevels = mipLevels; md.ArraySize = 1;
+    md.Format = DXGI_FORMAT_B8G8R8A8_UNORM; md.SampleDesc.Count = 1;
+    md.Usage = D3D11_USAGE_DEFAULT;
+    md.BindFlags = D3D11_BIND_SHADER_RESOURCE | (factor > 1 ? D3D11_BIND_RENDER_TARGET : 0);
+    md.MiscFlags = (factor > 1) ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
+    com_ptr<ID3D11Texture2D> mipTex;
+    if (FAILED(d3d->CreateTexture2D(&md, nullptr, mipTex.put()))) return 6;
+    com_ptr<ID3D11ShaderResourceView> srv;
+    if (factor > 1 && FAILED(d3d->CreateShaderResourceView(mipTex.get(), nullptr, srv.put()))) return 6;
+
+    // CPU-readable staging at the EMITTED (downscaled) size.
     D3D11_TEXTURE2D_DESC sd = {};
-    sd.Width = g_w; sd.Height = g_h; sd.MipLevels = 1; sd.ArraySize = 1;
+    sd.Width = outW; sd.Height = outH; sd.MipLevels = 1; sd.ArraySize = 1;
     sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM; sd.SampleDesc.Count = 1;
     sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0;
     sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
@@ -87,18 +116,20 @@ int main(int argc, char** argv) {
         com_ptr<ID3D11Texture2D> src;
         if (FAILED(access->GetInterface(guid_of<ID3D11Texture2D>(), src.put_void()))) return;
         D3D11_TEXTURE2D_DESC fd = {}; src->GetDesc(&fd);
-        // Copy the overlapping region into the fixed staging (crop/pad on resize) so the
-        // output frame size never changes mid-stream (ffmpeg rawvideo needs a constant size).
-        UINT cw = fd.Width < (UINT)g_w ? fd.Width : (UINT)g_w;
+        // Copy the overlapping region into mip 0 (crop/pad on resize so the emitted size is
+        // constant — ffmpeg rawvideo needs a fixed size).
+        UINT cw = fd.Width  < (UINT)g_w ? fd.Width  : (UINT)g_w;
         UINT ch = fd.Height < (UINT)g_h ? fd.Height : (UINT)g_h;
         D3D11_BOX box = { 0, 0, 0, cw, ch, 1 };
-        ctx->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, src.get(), 0, &box);
+        ctx->CopySubresourceRegion(mipTex.get(), 0, 0, 0, 0, src.get(), 0, &box);
+        if (factor > 1) ctx->GenerateMips(srv.get());          // GPU downscale to the target mip
+        ctx->CopySubresourceRegion(staging.get(), 0, 0, 0, 0, mipTex.get(), outMip, nullptr);
         D3D11_MAPPED_SUBRESOURCE map;
         if (SUCCEEDED(ctx->Map(staging.get(), 0, D3D11_MAP_READ, 0, &map))) {
             std::lock_guard<std::mutex> lk(g_mtx);
             const BYTE* s = (const BYTE*)map.pData;
-            for (int y = 0; y < g_h; y++)
-                memcpy(&g_latest[(size_t)y * g_w * 4], s + (size_t)y * map.RowPitch, (size_t)g_w * 4);
+            for (int y = 0; y < outH; y++)
+                memcpy(&g_latest[(size_t)y * outW * 4], s + (size_t)y * map.RowPitch, (size_t)outW * 4);
             ctx->Unmap(staging.get(), 0);
         }
     });
@@ -107,7 +138,7 @@ int main(int argc, char** argv) {
 
     // Steady 30fps: emit the most-recent frame every ~33ms (duplicate when the window is
     // static — WGC only delivers on change). Gives ffmpeg a constant-rate rawvideo stream.
-    std::vector<BYTE> out((size_t)g_w * g_h * 4, 0);
+    std::vector<BYTE> out((size_t)outW * outH * 4, 0);
     LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
     LARGE_INTEGER next; QueryPerformanceCounter(&next);
     const double frameTicks = (double)freq.QuadPart / 30.0;

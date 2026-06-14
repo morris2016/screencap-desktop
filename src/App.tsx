@@ -7,7 +7,7 @@ import { Recorder, Streamer } from './engine/recorder';
 import { MicSource, ScreenSource, WebcamSource } from './engine/sources';
 import { DEFAULT_FX, presetBands, VoiceChain, type VoiceFx } from './engine/voicechain';
 import { YouTubePanel } from './components/YouTubePanel';
-import type { AudioApp, CaptureSourceInfo, LinkInfo, Scene, SceneItem, Source } from './engine/types';
+import type { AudioApp, CaptureSourceInfo, CaptureWindow, LinkInfo, Scene, SceneItem, Source } from './engine/types';
 
 interface LibItem {
   name: string;
@@ -54,6 +54,12 @@ export function App() {
   const [audioApps, setAudioApps] = useState<AudioApp[]>([]);
   const refreshAudioApps = () => window.screencap.listAudioApps().then(setAudioApps);
   useEffect(() => { void refreshAudioApps(); }, []);
+  // "Share one window" mode: pick a single window → wgccap captures only it (video) and only its
+  // app's audio (wasaploop of its PID). Scopes BOTH, fixing the "shared Discord but recorded
+  // other apps + Firefox audio" bug. null = full-screen/scene mode.
+  const [windowList, setWindowList] = useState<CaptureWindow[]>([]);
+  const [shareWindow, setShareWindow] = useState<CaptureWindow | null>(null);
+  const refreshWindows = () => window.screencap.listWindows().then(setWindowList);
   function toggleInternalApp(name: string) {
     setInternalAppNames((cur) => {
       const next = cur.includes(name) ? cur.filter((n) => n !== name) : [...cur, name];
@@ -338,12 +344,14 @@ export function App() {
     // Native-first (throttle-proof): direct mode → ffmpeg records screen + mic + system
     // audio (all native) itself. Scene mode keeps the compositor/MediaRecorder path.
     const nat = await nativeAudioPlan();
-    if (directMode && (nat.micDevice || nat.audio.system)) {
+    if (directMode && (nat.micDevice || nat.audio.system || nat.audio.windowHwnd)) {
       const res = await window.screencap.nativeRecordStart(nat.micDevice, nat.fx, nat.audio);
       if (res.ok) {
         nativeRecStart.current = Date.now();
         setRecState('recording');
-        setStatus('● recording (fully native: screen + mic + system audio)');
+        setStatus(nat.audio.windowHwnd
+          ? `● recording window: ${shareWindow?.title?.slice(0, 30)} (video + that app's audio + mic)`
+          : '● recording (fully native: screen + mic + system audio)');
         compositor.setPreviewFps(10); // free the iGPU for ddagrab+QSV
         window.screencap.sessionActive(true);
         return;
@@ -377,7 +385,12 @@ export function App() {
         .filter((p): p is number => typeof p === 'number' && p > 0);
     }
     const fx = micDevice && mic ? chains.get(mic.id)?.settings ?? null : null;
-    return { micDevice, fx, audio: { system, systemPids, sysGainDb, micGainDb } };
+    // Window-capture mode: bind video + audio to the one chosen window.
+    const win = shareWindow;
+    return {
+      micDevice, fx,
+      audio: { system, systemPids, sysGainDb, micGainDb, windowHwnd: win?.hwnd, windowPid: win?.pid },
+    };
   }
 
   function stopStream() {
@@ -530,6 +543,29 @@ export function App() {
               )}
             </div>
           ))}
+
+          <div style={{ marginTop: 14 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <h2 style={{ margin: '0 0 6px' }}>🪟 Share one window</h2>
+              <a style={{ cursor: 'pointer', color: 'var(--dim)', fontSize: 12 }} onClick={refreshWindows}>🔄 refresh</a>
+            </div>
+            <select
+              className="add" style={{ width: '100%', marginBottom: 0 }}
+              value={shareWindow ? String(shareWindow.hwnd) : ''}
+              onMouseDown={refreshWindows}
+              onChange={(e) => setShareWindow(windowList.find((x) => String(x.hwnd) === e.target.value) ?? null)}
+            >
+              <option value="">Full screen / scene (default)</option>
+              {windowList.map((w) => (
+                <option key={w.hwnd} value={String(w.hwnd)}>{w.name} — {w.title.slice(0, 40)}</option>
+              ))}
+            </select>
+            <small style={{ color: 'var(--dim)' }}>
+              {shareWindow
+                ? `Capturing ONLY “${shareWindow.title.slice(0, 32)}” — that window's video + that app's own audio + your mic. Other apps and their sound are excluded, even when you switch to them.`
+                : 'Off — captures the full screen + the internal-audio selection below.'}
+            </small>
+          </div>
 
           <div style={{ marginTop: 14 }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>

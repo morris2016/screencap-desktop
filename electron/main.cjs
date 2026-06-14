@@ -313,6 +313,71 @@ function wasaplooPath() {
   return null;
 }
 
+// Path to the native Windows Graphics Capture helper (per-window video). Dev: project/native/.
+function wgccapPath() {
+  const candidates = [
+    path.join(__dirname, '..', 'native', 'wgccap.exe'),
+    path.join(process.resourcesPath || '', 'native', 'wgccap.exe'),
+  ];
+  for (const c of candidates) { try { if (fs.existsSync(c)) return c; } catch {} }
+  return null;
+}
+
+// Serve per-app system audio over a Windows NAMED PIPE so ffmpeg can read it as a 2nd input
+// while its stdin carries the wgccap window video. Returns { pipePath, kill }.
+let sysPipeSeq = 0;
+function serveSysAudioPipe(pids) {
+  const net = require('net');
+  const pipePath = `\\\\.\\pipe\\sc_sys_${process.pid}_${sysPipeSeq++}`;
+  let procs = [];
+  const server = net.createServer((sock) => {
+    sock.on('error', () => {});
+    procs = spawnSysAudio(pids, sock); // one wasaploop per app, mixed in Node → the socket
+    sock.on('close', () => { for (const p of procs) { try { p.kill(); } catch {} } });
+  });
+  server.on('error', () => {});
+  server.listen(pipePath);
+  return { pipePath, kill() { try { server.close(); } catch {} for (const p of procs) { try { p.kill(); } catch {} } } };
+}
+
+// Spawn wgccap for a window; call back (err, proc, W, H) once it reports its emitted size.
+function spawnWindowVideo(hwnd, maxH, cb) {
+  const { spawn } = require('child_process');
+  const wp = wgccapPath();
+  if (!wp) return cb(new Error('wgccap missing'));
+  const p = spawn(wp, [String(hwnd), String(maxH || 1080)], { stdio: ['ignore', 'pipe', 'pipe'] });
+  let buf = '', done = false;
+  const finish = (err, w, h) => { if (done) return; done = true; cb(err, p, w, h); };
+  p.stderr.on('data', (d) => { buf += d.toString(); const m = buf.match(/WGC_SIZE w=(\d+) h=(\d+)/); if (m) finish(null, +m[1], +m[2]); });
+  p.on('error', (e) => finish(e));
+  p.stdout.on('error', () => {});
+  setTimeout(() => finish(new Error('wgc no size in 4s')), 4000);
+}
+
+// Build the ffmpeg input/filter/map for WINDOW-capture mode: video = wgccap rawvideo on stdin
+// (input 0), mic = dshow (input 1), per-app system audio = f32le named pipe (input 2). Mic peak
+// control stays on the mic channel; system app audio rides through at unity (no cross-duck).
+function windowFfmpegAV({ W, H, micDevice, fx, sysPipePath, useQsv }) {
+  const inputs = ['-f', 'rawvideo', '-pixel_format', 'bgra', '-video_size', `${W}x${H}`, '-framerate', '30', '-thread_queue_size', '64', '-i', 'pipe:0'];
+  let mi = -1, si = -1, n = 1;
+  if (micDevice) { inputs.push('-f', 'dshow', '-audio_buffer_size', '80', '-thread_queue_size', '4096', '-rtbufsize', '64M', '-i', `audio=${micDevice}`); mi = n++; }
+  if (sysPipePath) { inputs.push('-f', 'f32le', '-ar', '48000', '-ac', '2', '-thread_queue_size', '4096', '-i', sysPipePath); si = n++; }
+  const vseg = useQsv
+    ? `[0:v]scale=-2:'min(1080,ih)',format=nv12,hwupload[v]`
+    : `[0:v]scale=-2:'min(1080,ih)',format=yuv420p[v]`;
+  const aseg = [];
+  let amap = null;
+  if (mi >= 0 && si >= 0) {
+    aseg.push(`[${mi}:a]${voiceChainFilter(fx, { limiter: false })},volume=0dB,alimiter=limit=0.5:attack=5:release=50:level=disabled[m]`);
+    aseg.push(`[${si}:a]aresample=async=1:first_pts=0[s]`);
+    aseg.push(`[m][s]amix=inputs=2:duration=longest:normalize=0[aout]`);
+    amap = '[aout]';
+  } else if (mi >= 0) { aseg.push(`[${mi}:a]${voiceChainFilter(fx)}[aout]`); amap = '[aout]'; }
+  else if (si >= 0) { aseg.push(`[${si}:a]aresample=async=1:first_pts=0[aout]`); amap = '[aout]'; }
+  const hw = useQsv ? ['-init_hw_device', 'qsv=qs', '-filter_hw_device', 'qs'] : [];
+  return { hw, inputs, fc: [vseg, ...aseg].join(';'), maps: ['-map', '[v]', ...(amap ? ['-map', amap] : [])], hasAudio: !!amap };
+}
+
 /**
  * Build the native audio half of an ffmpeg capture: dshow mic and/or WASAPI-loopback system
  * audio, mixed in-filter. Returns { inputs, filterSegs, mapLabel, usePipe }. usePipe=true means
@@ -611,8 +676,8 @@ ipcMain.handle('stream-stop', () => {
 // dshow mic + ffmpeg voice chain as native live — recordings survive a minimized window
 // because no Chromium process carries the media. Runs fine alongside a live stream
 // (second QSV session). 'q' on stdin = clean ffmpeg shutdown = intact file.
-const nrec = { proc: null, tmp: null, out: null, stopping: false, sysProcs: [] };
-ipcMain.handle('native-record-start', (e, micDevice, fx, audio) => {
+const nrec = { proc: null, tmp: null, out: null, stopping: false, sysProcs: [], winProcs: [], winPipe: null, windowMode: false, qsvBroken: false };
+ipcMain.handle('native-record-start', async (e, micDevice, fx, audio) => {
   const ff = ffmpegPath();
   if (!ff) return { ok: false, error: 'ffmpeg not found' };
   if (nrec.proc) return { ok: false, error: 'already recording' };
@@ -622,6 +687,53 @@ ipcMain.handle('native-record-start', (e, micDevice, fx, audio) => {
   nrec.tmp = path.join(dir, `.live_${stamp}.mkv`);
   nrec.out = path.join(dir, `ScreenCap_${stamp}.mp4`);
   nrec.stopping = false;
+  nrec.windowMode = false;
+
+  // WINDOW-CAPTURE MODE: share exactly ONE window. Video = wgccap of that HWND (scoped to the
+  // window even when it's occluded or you navigate away), audio = only that app's PID (wasaploop)
+  // + mic. Fixes "sharing Discord also recorded other apps + Firefox audio" — both video and
+  // audio are bound to the one window, not the whole screen / all-system.
+  const windowHwnd = audio && Number(audio.windowHwnd);
+  const windowPid = audio && Number(audio.windowPid);
+  if (windowHwnd && wgccapPath()) {
+    nrec.windowMode = true;
+    let resolved = false;
+    return await new Promise((resolve) => {
+      const launch = (useQsv) => {
+        spawnWindowVideo(windowHwnd, 1080, (err, wg, W, H) => {
+          if (err || !wg) { try { wg && wg.kill(); } catch {} if (!resolved) { resolved = true; resolve({ ok: false, error: 'window capture unavailable' }); } return; }
+          const pipe = windowPid > 0 ? serveSysAudioPipe([windowPid]) : null;
+          const av = windowFfmpegAV({ W, H, micDevice, fx, sysPipePath: pipe && pipe.pipePath, useQsv });
+          const venc = useQsv
+            ? ['-c:v', 'h264_qsv', '-preset', 'veryfast', '-b:v', '8000k', '-maxrate', '8000k', '-bufsize', '16000k', '-g', '60']
+            : ['-c:v', 'libx264', '-preset', 'superfast', '-pix_fmt', 'yuv420p', '-b:v', '8000k', '-g', '60'];
+          const p = spawn(ff, [...av.hw, ...av.inputs, '-filter_complex', av.fc, ...av.maps,
+            ...venc, ...(av.hasAudio ? ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000'] : []),
+            '-fps_mode', 'passthrough', '-y', nrec.tmp], { stdio: ['pipe', 'ignore', 'pipe'] });
+          try { require('os').setPriority(p.pid, require('os').constants.priority.PRIORITY_HIGH); } catch {}
+          p.stdin.on('error', () => {}); p.on('error', () => {}); wg.stdout.on('error', () => {});
+          wg.stdout.pipe(p.stdin);
+          nrec.winProcs = [wg]; nrec.winPipe = pipe; nrec.proc = p;
+          const spawnedAt = Date.now();
+          p.on('close', () => {
+            if (nrec.proc !== p) return;
+            nrec.proc = null;
+            for (const w of nrec.winProcs || []) { try { w.kill(); } catch {} }
+            if (nrec.winPipe) { try { nrec.winPipe.kill(); } catch {} }
+            nrec.winProcs = []; nrec.winPipe = null;
+            if (!nrec.stopping && Date.now() - spawnedAt < 3_000) {
+              try { fs.unlinkSync(nrec.tmp); } catch {}
+              if (useQsv) { nrec.qsvBroken = true; launch(false); return; } // QSV died → retry x264
+              sendAll('native-record-failed');
+            }
+          });
+          if (!resolved) { resolved = true; resolve({ ok: true }); }
+        });
+      };
+      launch(!nrec.qsvBroken);
+    });
+  }
+
   const na = buildNativeAudio({
     micDevice,
     wantSystem: !!(audio && audio.system),
@@ -671,14 +783,18 @@ ipcMain.handle('native-record-stop', async () => {
   const p = nrec.proc;
   if (!p) return null;
   nrec.stopping = true;
-  // Stop system audio first so it stops feeding stdin, then stop ffmpeg.
+  // Stop the audio/video feeders first so they stop writing to ffmpeg, then stop ffmpeg.
   for (const sp of nrec.sysProcs || []) { try { sp.kill(); } catch {} }
   nrec.sysProcs = [];
+  for (const w of nrec.winProcs || []) { try { w.kill(); } catch {} }
+  nrec.winProcs = [];
+  if (nrec.winPipe) { try { nrec.winPipe.kill(); } catch {} nrec.winPipe = null; }
   const closed = new Promise((resolve) => p.on('close', resolve));
-  // When stdin carries system-audio PCM we can't send 'q' there — kill (mkv remuxes
-  // losslessly, verified). Without system audio, 'q' for a clean shutdown, kill as backstop.
-  if (!nrec.usePipe) { try { p.stdin.write('q'); } catch {} }
-  const backstop = setTimeout(() => { try { p.kill(); } catch {} }, nrec.usePipe ? 300 : 1_500);
+  // When stdin carries PCM (sys audio) or window video we can't send 'q' there — kill (mkv
+  // remuxes losslessly). Without that, 'q' for a clean shutdown with a kill backstop.
+  const stdinIsData = nrec.usePipe || nrec.windowMode;
+  if (!stdinIsData) { try { p.stdin.write('q'); } catch {} }
+  const backstop = setTimeout(() => { try { p.kill(); } catch {} }, stdinIsData ? 300 : 1_500);
   await closed;
   clearTimeout(backstop);
   nrec.proc = null;
@@ -764,6 +880,23 @@ ipcMain.handle('list-audio-apps', () => {
             }
           }
           resolve([...byName.values()]);
+        } catch { resolve([]); }
+      });
+  });
+});
+// Top-level windows for "share one window" mode: each row carries the HWND (for wgccap video)
+// AND the owning PID (for wasaploop per-app audio) — so picking a window scopes BOTH.
+ipcMain.handle('list-windows', () => {
+  return new Promise((resolve) => {
+    require('child_process').execFile('powershell.exe', ['-NoProfile', '-Command',
+      "Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { [pscustomobject]@{ hwnd=[int64]$_.MainWindowHandle; pid=$_.Id; name=$_.ProcessName; title=$_.MainWindowTitle } } | ConvertTo-Json -Compress"],
+      { windowsHide: true, timeout: 5000 }, (err, stdout) => {
+        if (err) return resolve([]);
+        try {
+          let arr = JSON.parse(stdout);
+          if (!Array.isArray(arr)) arr = [arr];
+          // Drop our own windows; keep real app windows with a valid HWND.
+          resolve(arr.filter((w) => w.hwnd && !/ScreenCap Studio|electron/i.test(w.name || '')));
         } catch { resolve([]); }
       });
   });

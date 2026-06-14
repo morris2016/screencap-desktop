@@ -109,11 +109,16 @@ int main(int argc, char** argv) {
             evt = CreateEvent(NULL, FALSE, FALSE, NULL);
             pClient->SetEventHandle(evt);
         } else {
-            // Per-app capture unavailable (older OS / restricted context) → full system audio.
-            fprintf(stderr, "process-loopback unavailable, falling back to system audio\n");
+            // A specific app was requested but per-app capture failed. Do NOT fall back to
+            // all-system audio — that silently leaks EVERY app's sound (e.g. recording Firefox
+            // when only Discord was asked for). Fail; the caller gets no app audio rather than
+            // the wrong audio. (pid==0 still uses the endpoint = all-system, by design.)
+            fprintf(stderr, "process-loopback failed for pid %lu; refusing all-system fallback\n", pid);
+            return 3;
         }
+    } else {
+        pClient = endpointClient(&pwfx);
     }
-    if (!pClient) pClient = endpointClient(&pwfx);
     if (!pClient || !pwfx) { fprintf(stderr, "WASAPI_FMT error\n"); return 2; }
 
     int isFloat = (pwfx->wFormatTag == WAVE_FORMAT_IEEE_FLOAT) ||
