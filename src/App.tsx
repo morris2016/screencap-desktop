@@ -356,10 +356,17 @@ export function App() {
   async function nativeAudioPlan() {
     const mic = directMode ? sources.find((s) => s.kind === 'mic') : undefined;
     const micDevice = mic?.label ?? null;
-    // System audio (Discord, music, game) is captured natively (WASAPI loopback) when the
-    // user streams any screen/system source; fallback on so a mic-less direct stream isn't silent.
-    let system = directMode && sources.some((s) => s.kind === 'screen' && !!s.audioNode);
-    if (directMode && !micDevice && !system) system = true;
+    // System audio (Discord, music, game) is captured NATIVELY (WASAPI loopback / wasaploop)
+    // in direct mode — NOT via a WebAudio audioNode. So capture it whenever the user is sharing
+    // a screen OR has picked internal apps, and NEVER gate it off just because a mic is also
+    // present. (The old `screen && audioNode` test + a mic-less-only fallback meant that the
+    // instant a mic was added, Discord/system audio silently vanished from the capture — the
+    // only "Discord" left was the mic picking up headphone earcup bleed.)
+    const system = directMode && (
+      internalAppNames.length > 0 ||                 // explicitly picked apps (e.g. Discord)
+      sources.some((s) => s.kind === 'screen') ||    // sharing a screen → want its audio
+      !micDevice                                     // mic-less direct stream isn't silent
+    );
     // Per-app internal audio: resolve the chosen process names → their CURRENT pids so only
     // those apps' sound is captured, kept separate from the mic. [] = all system audio.
     let systemPids: number[] = [];
