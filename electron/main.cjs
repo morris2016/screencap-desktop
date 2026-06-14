@@ -197,6 +197,8 @@ const stream = {
   micDevice: null,      // dshow device name → FULLY native audio (no Chromium in the path)
   wantSystem: false,    // also capture system audio (WASAPI loopback) and mix it with the mic
   systemPids: [],       // capture ONLY these process trees' audio (per-app, multi); [] = all system
+  systemGains: [],      // per-app volume in dB, parallel to systemPids (<=-60 = muted)
+  windowGainDb: 0,      // window-mode app volume in dB (<=-60 = muted)
   sysGainDb: 0,         // system-audio level trim in dB (operator-controlled)
   micGainDb: 0,         // mic level trim in dB (operator-controlled, post voice chain)
   sysProcs: [],         // the wasaploop children feeding system audio into ffmpeg stdin
@@ -205,6 +207,7 @@ const stream = {
   winProcs: [],         // wgccap child(ren) feeding window video into ffmpeg stdin
   winPipe: null,        // named-pipe server carrying the window app's audio
   winEnc: 'nvenc',      // window-stream encoder ladder: nvenc → qsv → x264
+  gainRef: null,        // live per-app volume ref the Node mixer reads each block
   fx: null,             // VoiceFx settings from the renderer → ffmpeg filter chain
   qsvBroken: false,     // QuickSync failed this session — fall back to libx264
   spawnMs: 0,           // watchdog startup-grace anchor
@@ -262,7 +265,16 @@ function voiceChainFilter(fx, opts = {}) {
 // Spawn the WASAPI loopback capturer(s) and feed ffmpeg's stdin. With multiple selected apps,
 // run one wasaploop per app and mix their f32le streams frame-aligned in Node, so ffmpeg still
 // reads a single internal-audio input. pids=[] → one capturer of ALL system audio.
-function spawnSysAudio(pids, ffStdin) {
+// Per-app volume is a MUTABLE linear-gain ref the running mixer reads every block, so the
+// operator can ride or MUTE an app LIVE mid-stream (e.g. duck Discord while talking) and the
+// viewer hears exactly that. <=-60dB = muted (gain 0).
+function makeGainRef(gainsDb) { const r = { lin: [] }; updateGainRef(r, gainsDb); return r; }
+function updateGainRef(ref, gainsDb) {
+  const d2l = (db) => (typeof db !== 'number' || db <= -60) ? 0 : Math.pow(10, db / 20);
+  ref.lin = Array.isArray(gainsDb) ? gainsDb.map(d2l) : [];
+}
+
+function spawnSysAudio(pids, ffStdin, gainRef) {
   const { spawn } = require('child_process');
   const wp = wasaplooPath();
   if (!wp) return [];
@@ -273,32 +285,30 @@ function spawnSysAudio(pids, ffStdin) {
     p.stdout.on('error', () => {});
     return p;
   });
-  if (procs.length === 1) {
-    try { procs[0].stdout.pipe(ffStdin); } catch {}
-  } else {
-    mixPcmStreams(procs.map((p) => p.stdout), ffStdin);
-  }
+  // Always route through the mixer (even for one app) so live per-app gain/mute applies.
+  mixPcmStreams(procs.map((p) => p.stdout), ffStdin, gainRef);
   return procs;
 }
 
-// Sum N f32le/48k/stereo streams sample-by-sample into one. All capturers share the render
-// clock and emit silence-as-zeros continuously, so the streams stay frame-aligned; the slowest
-// gates output. No clamp — downstream ffmpeg volume + limiter manage headroom.
-function mixPcmStreams(streams, out) {
+// Sum N f32le/48k/stereo streams sample-by-sample, each scaled by its LIVE per-app gain
+// (gainRef.lin[i], default unity). Capturers share the render clock and emit silence-as-zeros
+// continuously, so the streams stay frame-aligned; the slowest gates output.
+function mixPcmStreams(streams, out, gainRef) {
+  const gainOf = (i) => { const v = gainRef && gainRef.lin && gainRef.lin[i]; return (typeof v === 'number') ? v : 1; };
   const state = streams.map(() => ({ buf: Buffer.alloc(0), alive: true }));
   const drain = () => {
-    const live = state.filter((s) => s.alive);
+    const live = state.map((s, i) => ({ s, i })).filter((x) => x.s.alive);
     if (!live.length) return;
-    let min = Math.min(...live.map((s) => s.buf.length));
+    let min = Math.min(...live.map((x) => x.s.buf.length));
     min -= min % 4;
     if (min <= 0) return;
     const mixed = Buffer.alloc(min);
     for (let off = 0; off < min; off += 4) {
       let sum = 0;
-      for (const s of live) sum += s.buf.readFloatLE(off);
+      for (const x of live) sum += x.s.buf.readFloatLE(off) * gainOf(x.i);
       mixed.writeFloatLE(sum, off);
     }
-    for (const s of live) s.buf = s.buf.subarray(min);
+    for (const x of live) x.s.buf = x.s.buf.subarray(min);
     try { out.write(mixed); } catch {}
   };
   streams.forEach((s, i) => {
@@ -331,13 +341,13 @@ function wgccapPath() {
 // Serve per-app system audio over a Windows NAMED PIPE so ffmpeg can read it as a 2nd input
 // while its stdin carries the wgccap window video. Returns { pipePath, kill }.
 let sysPipeSeq = 0;
-function serveSysAudioPipe(pids) {
+function serveSysAudioPipe(pids, gainRef) {
   const net = require('net');
   const pipePath = `\\\\.\\pipe\\sc_sys_${process.pid}_${sysPipeSeq++}`;
   let procs = [];
   const server = net.createServer((sock) => {
     sock.on('error', () => {});
-    procs = spawnSysAudio(pids, sock); // one wasaploop per app, mixed in Node → the socket
+    procs = spawnSysAudio(pids, sock, gainRef); // one wasaploop per app, gain+mix in Node → socket
     sock.on('close', () => { for (const p of procs) { try { p.kill(); } catch {} } });
   });
   server.on('error', () => {});
@@ -521,7 +531,7 @@ function spawnStream() {
   finishStreamSpawn(p, useQsv, logPath, () => {
     // System audio: pipe the native WASAPI loopback capturer into ffmpeg's stdin.
     // One capturer per selected app (clean, per-app), mixed in Node → ffmpeg stdin; [] = all.
-    if (useSysPipe) stream.sysProcs = spawnSysAudio(stream.systemPids, p.stdin);
+    if (useSysPipe) stream.sysProcs = spawnSysAudio(stream.systemPids, p.stdin, stream.gainRef);
   });
 }
 
@@ -538,7 +548,7 @@ function spawnStreamWindow(ff, logPath) {
       else sendAll('stream-ended', -1, 'window capture unavailable');
       return;
     }
-    const pipe = stream.windowPid > 0 ? serveSysAudioPipe([stream.windowPid]) : null;
+    const pipe = stream.windowPid > 0 ? serveSysAudioPipe([stream.windowPid], stream.gainRef) : null;
     const av = windowFfmpegAV({ W, H, micDevice: stream.micDevice, fx: stream.fx, sysPipePath: pipe && pipe.pipePath, encoder: enc });
     const venc = windowVenc(enc, stream.bitrateK, true);
     const p = spawn(ff, [...av.hw, ...av.inputs, '-filter_complex', av.fc, ...av.maps, ...venc,
@@ -708,6 +718,10 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx, au
   stream.micGainDb = (audio && typeof audio.micGainDb === 'number') ? audio.micGainDb : 0;
   stream.windowHwnd = (direct && audio && Number(audio.windowHwnd)) || 0; // window-capture mode
   stream.windowPid = (audio && Number(audio.windowPid)) || 0;
+  stream.systemGains = (audio && Array.isArray(audio.systemGains)) ? audio.systemGains.map(Number) : [];
+  stream.windowGainDb = (audio && typeof audio.windowGainDb === 'number') ? audio.windowGainDb : 0;
+  // Live per-app volume ref (read by the mixer every block; updated via 'set-sys-gains').
+  stream.gainRef = makeGainRef(stream.windowHwnd ? [stream.windowGainDb] : stream.systemGains);
   stream.winEnc = 'nvenc'; // window encoder ladder start: NVIDIA NVENC (off the capture iGPU)
   stream.qsvBroken = false; // re-probe QuickSync each go-live
   stream.wanted = true;
@@ -750,7 +764,7 @@ ipcMain.handle('stream-stop', () => {
 // dshow mic + ffmpeg voice chain as native live — recordings survive a minimized window
 // because no Chromium process carries the media. Runs fine alongside a live stream
 // (second QSV session). 'q' on stdin = clean ffmpeg shutdown = intact file.
-const nrec = { proc: null, tmp: null, out: null, stopping: false, sysProcs: [], winProcs: [], winPipe: null, windowMode: false, qsvBroken: false };
+const nrec = { proc: null, tmp: null, out: null, stopping: false, sysProcs: [], winProcs: [], winPipe: null, windowMode: false, qsvBroken: false, gainRef: null };
 ipcMain.handle('native-record-start', async (e, micDevice, fx, audio) => {
   const ff = ffmpegPath();
   if (!ff) return { ok: false, error: 'ffmpeg not found' };
@@ -769,14 +783,16 @@ ipcMain.handle('native-record-start', async (e, micDevice, fx, audio) => {
   // audio are bound to the one window, not the whole screen / all-system.
   const windowHwnd = audio && Number(audio.windowHwnd);
   const windowPid = audio && Number(audio.windowPid);
+  const windowGainDb = (audio && typeof audio.windowGainDb === 'number') ? audio.windowGainDb : 0;
   if (windowHwnd && wgccapPath()) {
     nrec.windowMode = true;
+    nrec.gainRef = makeGainRef([windowGainDb]); // live per-app volume for the shared window app
     let resolved = false;
     return await new Promise((resolve) => {
       const launch = (useQsv) => {
         spawnWindowVideo(windowHwnd, 1080, (err, wg, W, H) => {
           if (err || !wg) { try { wg && wg.kill(); } catch {} if (!resolved) { resolved = true; resolve({ ok: false, error: 'window capture unavailable' }); } return; }
-          const pipe = windowPid > 0 ? serveSysAudioPipe([windowPid]) : null;
+          const pipe = windowPid > 0 ? serveSysAudioPipe([windowPid], nrec.gainRef) : null;
           const recEnc = useQsv ? 'qsv' : 'x264';
           const av = windowFfmpegAV({ W, H, micDevice, fx, sysPipePath: pipe && pipe.pipePath, encoder: recEnc });
           const venc = windowVenc(recEnc, 8000, false);
@@ -835,7 +851,9 @@ ipcMain.handle('native-record-start', async (e, micDevice, fx, audio) => {
   nrec.sysProcs = [];
   if (na.usePipe) {
     const pids = (audio && Array.isArray(audio.systemPids)) ? audio.systemPids.map(Number).filter(Boolean) : [];
-    nrec.sysProcs = spawnSysAudio(pids, p.stdin);
+    const gains = (audio && Array.isArray(audio.systemGains)) ? audio.systemGains.map(Number) : [];
+    nrec.gainRef = makeGainRef(gains);
+    nrec.sysProcs = spawnSysAudio(pids, p.stdin, nrec.gainRef);
   }
   const spawnedAt = Date.now();
   p.on('close', () => {
@@ -973,6 +991,12 @@ ipcMain.handle('list-windows', () => {
         } catch { resolve([]); }
       });
   });
+});
+// Live per-app volume/mute: update the running stream AND recording mixers in place (gainsDb is
+// parallel to the active app order — or [windowGainDb] in window mode). Takes effect immediately.
+ipcMain.on('set-sys-gains', (_e, gainsDb) => {
+  if (stream.gainRef) updateGainRef(stream.gainRef, gainsDb);
+  if (nrec.gainRef) updateGainRef(nrec.gainRef, gainsDb);
 });
 ytHandle('yt-status', (s) => s.getStatus());
 ytHandle('yt-set-credentials', (s, id, secret) => s.setCredentials(id, secret));

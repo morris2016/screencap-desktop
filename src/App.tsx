@@ -70,6 +70,21 @@ export function App() {
   // Independent operator-controlled levels for the native mix (Discord never auto-ducks).
   const [sysGainDb, setSysGainDb] = useState(Number(localStorage.getItem('sysGainDb') ?? '0'));
   const [micGainDb, setMicGainDb] = useState(Number(localStorage.getItem('micGainDb') ?? '0'));
+  // Per-app volume + mute (keyed by app/process name) — operator rides or mutes each app's sound
+  // (e.g. duck Discord while speaking); viewers hear exactly the controlled level. -120 = muted.
+  const [appGains, setAppGains] = useState<Record<string, number>>(JSON.parse(localStorage.getItem('appGains') ?? '{}'));
+  const [appMuted, setAppMuted] = useState<Record<string, boolean>>(JSON.parse(localStorage.getItem('appMuted') ?? '{}'));
+  const setAppGain = (name: string, db: number) =>
+    setAppGains((g) => { const n = { ...g, [name]: db }; localStorage.setItem('appGains', JSON.stringify(n)); return n; });
+  const toggleAppMute = (name: string) =>
+    setAppMuted((m) => { const n = { ...m, [name]: !m[name] }; localStorage.setItem('appMuted', JSON.stringify(n)); return n; });
+  const appGainDb = (name: string) => (appMuted[name] ? -120 : (appGains[name] ?? 0));
+  // Push per-app volume/mute to the running stream + recording mixers LIVE (order matches the
+  // capture: the picked apps, or the single shared window). No-op in the backend if idle.
+  useEffect(() => {
+    const gainApps = shareWindow ? [shareWindow.name] : internalAppNames;
+    window.screencap.setSysGains(gainApps.map((n) => (appMuted[n] ? -120 : (appGains[n] ?? 0))));
+  }, [appGains, appMuted, internalAppNames, shareWindow]);
   const [streamUrl, setStreamUrl] = useState(localStorage.getItem('streamUrl') ?? 'rtmp://a.rtmp.youtube.com/live2');
   // Native capture is the ONLY streaming engine now — ffmpeg captures screen + mic + system
   // audio directly (no Chromium in the media path). The old MediaRecorder pipe path and its
@@ -377,19 +392,29 @@ export function App() {
     );
     // Per-app internal audio: resolve the chosen process names → their CURRENT pids so only
     // those apps' sound is captured, kept separate from the mic. [] = all system audio.
-    let systemPids: number[] = [];
+    // systemGains is PARALLEL to systemPids — each app's operator-set volume (or mute).
+    const systemPids: number[] = [];
+    const systemGains: number[] = [];
     if (system && internalAppNames.length) {
       const apps = await window.screencap.listAudioApps();
-      systemPids = internalAppNames
-        .map((n) => apps.find((a) => a.name === n)?.pid)
-        .filter((p): p is number => typeof p === 'number' && p > 0);
+      for (const n of internalAppNames) {
+        const pid = apps.find((a) => a.name === n)?.pid;
+        if (typeof pid === 'number' && pid > 0) { systemPids.push(pid); systemGains.push(appGainDb(n)); }
+      }
     }
     const fx = micDevice && mic ? chains.get(mic.id)?.settings ?? null : null;
-    // Window-capture mode: bind video + audio to the one chosen window.
+    // Window-capture mode: bind video + audio to the one chosen window (its app's volume too).
     const win = shareWindow;
+    // In per-app / window mode the per-app gains ARE the control, so the ffmpeg master system
+    // trim is unity (else it would multiply on top). Master only applies in all-system mode.
+    const masterSys = (win || internalAppNames.length) ? 0 : sysGainDb;
     return {
       micDevice, fx,
-      audio: { system, systemPids, sysGainDb, micGainDb, windowHwnd: win?.hwnd, windowPid: win?.pid },
+      audio: {
+        system, systemPids, systemGains, sysGainDb: masterSys, micGainDb,
+        windowHwnd: win?.hwnd, windowPid: win?.pid,
+        windowGainDb: win ? appGainDb(win.name) : 0,
+      },
     };
   }
 
@@ -544,64 +569,8 @@ export function App() {
             </div>
           ))}
 
-          <div style={{ marginTop: 14 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h2 style={{ margin: '0 0 6px' }}>🪟 Share one window</h2>
-              <a style={{ cursor: 'pointer', color: 'var(--dim)', fontSize: 12 }} onClick={refreshWindows}>🔄 refresh</a>
-            </div>
-            <select
-              className="add" style={{ width: '100%', marginBottom: 0 }}
-              value={shareWindow ? String(shareWindow.hwnd) : ''}
-              onMouseDown={refreshWindows}
-              onChange={(e) => setShareWindow(windowList.find((x) => String(x.hwnd) === e.target.value) ?? null)}
-            >
-              <option value="">Full screen / scene (default)</option>
-              {windowList.map((w) => (
-                <option key={w.hwnd} value={String(w.hwnd)}>{w.name} — {w.title.slice(0, 40)}</option>
-              ))}
-            </select>
-            <small style={{ color: 'var(--dim)' }}>
-              {shareWindow
-                ? `Capturing ONLY “${shareWindow.title.slice(0, 32)}” — that window's video + that app's own audio + your mic. Other apps and their sound are excluded, even when you switch to them.`
-                : 'Off — captures the full screen + the internal-audio selection below.'}
-            </small>
-          </div>
-
-          <div style={{ marginTop: 14 }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <h2 style={{ margin: '0 0 6px' }}>🔊 Internal audio</h2>
-              <a style={{ cursor: 'pointer', color: 'var(--dim)', fontSize: 12 }} onClick={refreshAudioApps}>🔄 refresh</a>
-            </div>
-            <div style={{ maxHeight: 150, overflowY: 'auto', border: '1px solid #2a2a35', borderRadius: 8, padding: 6 }}>
-              <label style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, cursor: 'pointer', padding: '2px 0' }}>
-                <input type="checkbox" checked={internalAppNames.length === 0}
-                  onChange={() => { setInternalAppNames([]); localStorage.setItem('internalApps', '[]'); }} />
-                <b>All system audio</b>
-              </label>
-              {audioApps.map((a) => (
-                <label key={a.name} style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 12, cursor: 'pointer', padding: '2px 0' }}>
-                  <input type="checkbox" checked={internalAppNames.includes(a.name)} onChange={() => toggleInternalApp(a.name)} />
-                  <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {a.name}{a.title ? ` — ${a.title.slice(0, 28)}` : ''}
-                  </span>
-                </label>
-              ))}
-            </div>
-            <small style={{ color: 'var(--dim)' }}>
-              {internalAppNames.length
-                ? `Streaming only: ${internalAppNames.join(', ')} — each captured cleanly, separate from your mic.`
-                : 'Capturing all system audio. Tick apps (e.g. Discord) to stream only their sound.'}
-            </small>
-            <div style={{ display: 'grid', gap: 2, marginTop: 8, fontSize: 12 }}>
-              <label>🔊 Internal volume · {sysGainDb > 0 ? '+' : ''}{sysGainDb} dB</label>
-              <input type="range" min="-30" max="12" step="1" value={sysGainDb}
-                onChange={(e) => { const v = Number(e.target.value); setSysGainDb(v); localStorage.setItem('sysGainDb', String(v)); }} />
-              <label>🎙 Mic volume · {micGainDb > 0 ? '+' : ''}{micGainDb} dB</label>
-              <input type="range" min="-30" max="12" step="1" value={micGainDb}
-                onChange={(e) => { const v = Number(e.target.value); setMicGainDb(v); localStorage.setItem('micGainDb', String(v)); }} />
-              <small style={{ color: 'var(--dim)' }}>Independent levels — internal audio is never auto-ducked by the mic.</small>
-            </div>
-          </div>
+          {/* 🪟 Share-window + 🔊 internal-audio picker + per-app/mic faders live in the
+              full-width audio mixer at the bottom of the window. */}
 
           <div style={{ marginTop: 14 }}>
             <YouTubePanel live={live} startStream={startStream} stopStream={stopStream} />
@@ -734,6 +703,72 @@ export function App() {
       </div>
 
       <div className="mixer">
+        {/* ===== Audio: capture selection + per-app / mic levels (full-width mixer) ===== */}
+        <div className="strip" style={{ width: 236 }}>
+          <div className="name">🎛️ Capture</div>
+          <select className="add" style={{ width: '100%', marginBottom: 6, fontSize: 11, padding: 4 }}
+            value={shareWindow ? String(shareWindow.hwnd) : ''} onMouseDown={refreshWindows}
+            onChange={(e) => setShareWindow(windowList.find((x) => String(x.hwnd) === e.target.value) ?? null)}>
+            <option value="">🖥️ Full screen / scene</option>
+            {windowList.map((w) => (
+              <option key={w.hwnd} value={String(w.hwnd)}>🪟 {w.name} — {w.title.slice(0, 24)}</option>
+            ))}
+          </select>
+          {shareWindow ? (
+            <div style={{ fontSize: 11, color: 'var(--dim)' }}>Sharing only “{shareWindow.title.slice(0, 22)}” — its window video + its own audio + your mic.</div>
+          ) : (
+            <>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--dim)', marginBottom: 2 }}>
+                <span>Internal audio apps</span>
+                <a style={{ cursor: 'pointer' }} onClick={refreshAudioApps}>🔄</a>
+              </div>
+              <div style={{ maxHeight: 58, overflowY: 'auto', border: '1px solid #2a2a35', borderRadius: 6, padding: 4, fontSize: 11 }}>
+                <label style={{ display: 'flex', gap: 5, alignItems: 'center', cursor: 'pointer', padding: '1px 0' }}>
+                  <input type="checkbox" checked={internalAppNames.length === 0}
+                    onChange={() => { setInternalAppNames([]); localStorage.setItem('internalApps', '[]'); }} /><b>All system</b>
+                </label>
+                {audioApps.map((a) => (
+                  <label key={a.name} style={{ display: 'flex', gap: 5, alignItems: 'center', cursor: 'pointer', padding: '1px 0' }}>
+                    <input type="checkbox" checked={internalAppNames.includes(a.name)} onChange={() => toggleInternalApp(a.name)} />
+                    <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }} title={a.title}>{a.name}</span>
+                  </label>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+        {(() => {
+          const gainApps = shareWindow ? [shareWindow.name] : internalAppNames;
+          if (gainApps.length === 0) {
+            return (
+              <div className="strip">
+                <div className="name">🔊 System audio</div>
+                <input type="range" min="-30" max="12" step="1" value={sysGainDb}
+                  onChange={(e) => { const v = Number(e.target.value); setSysGainDb(v); localStorage.setItem('sysGainDb', String(v)); }} />
+                <div style={{ fontSize: 11, color: 'var(--dim)', textAlign: 'right' }}>{sysGainDb > 0 ? '+' : ''}{sysGainDb} dB</div>
+              </div>
+            );
+          }
+          return gainApps.map((name) => (
+            <div className="strip" key={'gain-' + name}>
+              <div className="name" title={name}>{name}
+                <a style={{ cursor: 'pointer', color: appMuted[name] ? 'var(--accent)' : 'var(--dim)', float: 'right' }}
+                  title={appMuted[name] ? 'unmute' : 'mute'} onClick={() => toggleAppMute(name)}>{appMuted[name] ? '🔇' : '🔊'}</a>
+              </div>
+              <input type="range" min="-40" max="12" step="1" disabled={appMuted[name]}
+                value={appGains[name] ?? 0} onChange={(e) => setAppGain(name, Number(e.target.value))} />
+              <div style={{ fontSize: 11, color: appMuted[name] ? '#e66' : 'var(--dim)', textAlign: 'right' }}>
+                {appMuted[name] ? 'muted' : `${(appGains[name] ?? 0) > 0 ? '+' : ''}${appGains[name] ?? 0} dB`}
+              </div>
+            </div>
+          ));
+        })()}
+        <div className="strip">
+          <div className="name">🎙 Mic level</div>
+          <input type="range" min="-30" max="12" step="1" value={micGainDb}
+            onChange={(e) => { const v = Number(e.target.value); setMicGainDb(v); localStorage.setItem('micGainDb', String(v)); }} />
+          <div style={{ fontSize: 11, color: 'var(--dim)', textAlign: 'right' }}>{micGainDb > 0 ? '+' : ''}{micGainDb} dB</div>
+        </div>
         {sources.filter((s) => s.audioNode).map((s) => (
           <div className="strip" key={s.id}>
             <div className="name">
@@ -890,11 +925,6 @@ export function App() {
             )}
           </div>
         ))}
-        {sources.filter((s) => s.audioNode).length === 0 && (
-          <small style={{ color: 'var(--dim)', alignSelf: 'center' }}>
-            Audio strips appear here (mic, system audio).
-          </small>
-        )}
       </div>
 
       {picker !== 'none' && (

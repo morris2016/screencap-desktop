@@ -114,6 +114,10 @@ export interface NativeAudioOpts {
   system: boolean;
   /** Capture ONLY these process trees' audio (per-app, multi-select). []/undefined = all system. */
   systemPids?: number[];
+  /** Per-app volume in dB, parallel to systemPids (operator-controlled; <=-60 = muted). */
+  systemGains?: number[];
+  /** Window-capture mode: the shared window app's volume in dB (<=-60 = muted). */
+  windowGainDb?: number;
   /** System-audio (internal) level trim in dB — operator-controlled. */
   sysGainDb?: number;
   /** Mic level trim in dB — operator-controlled. */
@@ -172,6 +176,7 @@ declare global {
       openExternal(url: string): Promise<void>;
       listAudioApps(): Promise<AudioApp[]>;
       listWindows(): Promise<CaptureWindow[]>;
+      setSysGains(gainsDb: number[]): void;
       nativeRecordStart(micDevice: string | null, fx: unknown, audio: NativeAudioOpts): Promise<{ ok: boolean; error?: string }>;
       nativeRecordStop(): Promise<string | null>;
       onNativeRecordFailed(cb: () => void): void;
