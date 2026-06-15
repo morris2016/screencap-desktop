@@ -77,6 +77,9 @@ export function App() {
   // Independent operator-controlled levels for the native mix (Discord never auto-ducks).
   const [sysGainDb, setSysGainDb] = useState(Number(localStorage.getItem('sysGainDb') ?? '0'));
   const [micGainDb, setMicGainDb] = useState(Number(localStorage.getItem('micGainDb') ?? '0'));
+  // A/V sync: WASAPI loopback delivers already-played audio, so system sound trails the live
+  // picture. Negative = advance system audio (fixes the lag). Default -100ms; operator fine-tunes.
+  const [sysDelayMs, setSysDelayMs] = useState(Number(localStorage.getItem('sysDelayMs') ?? '-100'));
   // Per-app volume + mute (keyed by app/process name) — operator rides or mutes each app's sound
   // (e.g. duck Discord while speaking); viewers hear exactly the controlled level. -120 = muted.
   const [appGains, setAppGains] = useState<Record<string, number>>(JSON.parse(localStorage.getItem('appGains') ?? '{}'));
@@ -422,6 +425,7 @@ export function App() {
         windowHwnd: win?.hwnd, windowPid: win?.pid,
         windowGainDb: win ? appGainDb(win.name) : 0,
         cam: cam && cam.device ? cam : null,
+        sysDelayMs,
       },
     };
   }
@@ -817,6 +821,15 @@ export function App() {
               </div>
             </>
           )}
+        </div>
+        <div className="strip" style={{ width: 176 }}>
+          <div className="name">⏱ A/V sync</div>
+          <input type="range" min="-400" max="400" step="10" value={sysDelayMs}
+            onChange={(e) => { const v = Number(e.target.value); setSysDelayMs(v); localStorage.setItem('sysDelayMs', String(v)); }} />
+          <div style={{ fontSize: 11, color: 'var(--dim)', textAlign: 'right' }}>
+            {sysDelayMs === 0 ? 'in sync' : sysDelayMs < 0 ? `audio ${-sysDelayMs}ms earlier` : `audio ${sysDelayMs}ms later`}
+          </div>
+          <div style={{ fontSize: 10, color: 'var(--dim)' }}>← drag left if audio lags the video</div>
         </div>
         {sources.filter((s) => s.audioNode).map((s) => (
           <div className="strip" key={s.id}>

@@ -209,6 +209,7 @@ const stream = {
   winEnc: 'nvenc',      // window-stream encoder ladder: nvenc → qsv → x264
   gainRef: null,        // live per-app volume ref the Node mixer reads each block
   cam: null,            // facecam overlay { device, pos, sizePct, mirror } or null
+  sysDelayMs: 0,        // A/V sync: shift system audio (-advance / +delay) to fix loopback lag
   fx: null,             // VoiceFx settings from the renderer → ffmpeg filter chain
   qsvBroken: false,     // QuickSync failed this session — fall back to libx264
   spawnMs: 0,           // watchdog startup-grace anchor
@@ -385,7 +386,7 @@ function camChain(baseLabel, outLabel, cam, camIdx) {
   return `[${camIdx}:v]${flip}scale=${cw}:-2[fc${camIdx}];[${baseLabel}][fc${camIdx}]overlay@ov=${xy}[${outLabel}]`;
 }
 
-function windowFfmpegAV({ W, H, micDevice, fx, sysPipePath, encoder, cam }) {
+function windowFfmpegAV({ W, H, micDevice, fx, sysPipePath, encoder, cam, sysDelayMs }) {
   const inputs = ['-f', 'rawvideo', '-pixel_format', 'bgra', '-video_size', `${W}x${H}`, '-framerate', '30', '-thread_queue_size', '64', '-i', 'pipe:0'];
   let mi = -1, si = -1, ci = -1, n = 1;
   if (micDevice) { inputs.push('-f', 'dshow', '-audio_buffer_size', '80', '-thread_queue_size', '4096', '-rtbufsize', '64M', '-i', `audio=${micDevice}`); mi = n++; }
@@ -405,13 +406,14 @@ function windowFfmpegAV({ W, H, micDevice, fx, sysPipePath, encoder, cam }) {
   }
   const aseg = [];
   let amap = null;
+  const sync = audioSyncFilter(sysDelayMs);
   if (mi >= 0 && si >= 0) {
     aseg.push(`[${mi}:a]${voiceChainFilter(fx, { limiter: false })},volume=0dB,alimiter=limit=0.5:attack=5:release=50:level=disabled[m]`);
-    aseg.push(`[${si}:a]aresample=async=1:first_pts=0[s]`);
+    aseg.push(`[${si}:a]aresample=async=1:first_pts=0${sync}[s]`);
     aseg.push(`[m][s]amix=inputs=2:duration=longest:normalize=0[aout]`);
     amap = '[aout]';
   } else if (mi >= 0) { aseg.push(`[${mi}:a]${voiceChainFilter(fx)}[aout]`); amap = '[aout]'; }
-  else if (si >= 0) { aseg.push(`[${si}:a]aresample=async=1:first_pts=0[aout]`); amap = '[aout]'; }
+  else if (si >= 0) { aseg.push(`[${si}:a]aresample=async=1:first_pts=0${sync}[aout]`); amap = '[aout]'; }
   return { hw, inputs, fc: [vseg, ...aseg].join(';'), maps: ['-map', '[v]', ...(amap ? ['-map', amap] : [])], hasAudio: !!amap };
 }
 
@@ -435,7 +437,18 @@ function windowVenc(encoder, bitrateK, forStream) {
  * audio, mixed in-filter. Returns { inputs, filterSegs, mapLabel, usePipe }. usePipe=true means
  * the caller must pipe wasaploop's stdout into ffmpeg's stdin (the system-audio source).
  */
-function buildNativeAudio({ micDevice, wantSystem, fx, sysGainDb, micGainDb }) {
+// Compensate the WASAPI loopback lag: the system audio is the sound already written to the render
+// buffer, so it trails the LIVE ddagrab/wgccap picture. Negative ms ADVANCES the audio (drops the
+// first |ms| and shifts earlier — fixes the common "audio lags video"); positive DELAYS it. Applied
+// to the SYSTEM channel only, so the mic stays aligned to the camera/picture.
+function audioSyncFilter(ms) {
+  const v = Math.round(Number(ms) || 0);
+  if (!v) return '';
+  if (v < 0) return `,atrim=start=${(-v / 1000).toFixed(3)},asetpts=PTS-STARTPTS`;
+  return `,adelay=${v}:all=1`;
+}
+
+function buildNativeAudio({ micDevice, wantSystem, fx, sysGainDb, micGainDb, sysDelayMs }) {
   const inputs = [];
   const segs = [];
   let n = 0, mi = -1, si = -1;
@@ -460,15 +473,16 @@ function buildNativeAudio({ micDevice, wantSystem, fx, sysGainDb, micGainDb }) {
     // (alimiter limit=0.5) so it can't run away or clip, then a PURE LINEAR SUM with Discord.
     // Verified: Discord level is identical mic-silent vs mic-talking (duck 0.00dB) and the bus
     // peaks at ~0dBFS with no clipping even with a hot mic over a loud (-6dBFS) Discord.
+    const sync = audioSyncFilter(sysDelayMs);
     segs.push(`[${mi}:a]${voiceChainFilter(fx, { limiter: false })},volume=${mdb}dB,alimiter=limit=0.5:attack=5:release=50:level=disabled[m]`);
-    segs.push(`[${si}:a]aresample=async=1:first_pts=0,volume=${sdb}dB[s]`);
+    segs.push(`[${si}:a]aresample=async=1:first_pts=0,volume=${sdb}dB${sync}[s]`);
     segs.push(`[m][s]amix=inputs=2:duration=longest:normalize=0[aout]`);
     mapLabel = '[aout]';
   } else if (mi >= 0) {
     segs.push(`[${mi}:a]${voiceChainFilter(fx)}[aout]`);
     mapLabel = '[aout]';
   } else if (si >= 0) {
-    segs.push(`[${si}:a]aresample=async=1:first_pts=0,volume=${sdb}dB,${lim}[aout]`);
+    segs.push(`[${si}:a]aresample=async=1:first_pts=0,volume=${sdb}dB,${lim}${audioSyncFilter(sysDelayMs)}[aout]`);
     mapLabel = '[aout]';
   }
   return { inputs, filterSegs: segs, mapLabel, usePipe: si >= 0 };
@@ -500,6 +514,7 @@ function spawnStream() {
       fx: stream.fx,
       sysGainDb: stream.sysGainDb,
       micGainDb: stream.micGainDb,
+      sysDelayMs: stream.sysDelayMs,
     });
     useSysPipe = na.usePipe;
     // Downscale to 1080p (keep aspect): a 1440p/4K desktop captured natively makes YouTube
@@ -580,7 +595,7 @@ function spawnStreamWindow(ff, logPath) {
       return;
     }
     const pipe = stream.windowPid > 0 ? serveSysAudioPipe([stream.windowPid], stream.gainRef) : null;
-    const av = windowFfmpegAV({ W, H, micDevice: stream.micDevice, fx: stream.fx, sysPipePath: pipe && pipe.pipePath, encoder: enc, cam: stream.cam });
+    const av = windowFfmpegAV({ W, H, micDevice: stream.micDevice, fx: stream.fx, sysPipePath: pipe && pipe.pipePath, encoder: enc, cam: stream.cam, sysDelayMs: stream.sysDelayMs });
     const venc = windowVenc(enc, stream.bitrateK, true);
     const p = spawn(ff, [...av.hw, ...av.inputs, '-filter_complex', av.fc, ...av.maps, ...venc,
       ...(av.hasAudio ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000'] : []),
@@ -754,6 +769,7 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx, au
   // Live per-app volume ref (read by the mixer every block; updated via 'set-sys-gains').
   stream.gainRef = makeGainRef(stream.windowHwnd ? [stream.windowGainDb] : stream.systemGains);
   stream.cam = (audio && audio.cam && audio.cam.device) ? audio.cam : null; // facecam overlay
+  stream.sysDelayMs = (audio && audio.sysDelayMs) || 0; // A/V sync compensation
   stream.winEnc = 'nvenc'; // window encoder ladder start: NVIDIA NVENC (off the capture iGPU)
   stream.qsvBroken = false; // re-probe QuickSync each go-live
   stream.wanted = true;
@@ -826,7 +842,7 @@ ipcMain.handle('native-record-start', async (e, micDevice, fx, audio) => {
           if (err || !wg) { try { wg && wg.kill(); } catch {} if (!resolved) { resolved = true; resolve({ ok: false, error: 'window capture unavailable' }); } return; }
           const pipe = windowPid > 0 ? serveSysAudioPipe([windowPid], nrec.gainRef) : null;
           const recEnc = useQsv ? 'qsv' : 'x264';
-          const av = windowFfmpegAV({ W, H, micDevice, fx, sysPipePath: pipe && pipe.pipePath, encoder: recEnc, cam: (audio && audio.cam) || null });
+          const av = windowFfmpegAV({ W, H, micDevice, fx, sysPipePath: pipe && pipe.pipePath, encoder: recEnc, cam: (audio && audio.cam) || null, sysDelayMs: (audio && audio.sysDelayMs) || 0 });
           const venc = windowVenc(recEnc, 8000, false);
           const p = spawn(ff, [...av.hw, ...av.inputs, '-filter_complex', av.fc, ...av.maps,
             ...venc, ...(av.hasAudio ? ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000'] : []),
@@ -861,6 +877,7 @@ ipcMain.handle('native-record-start', async (e, micDevice, fx, audio) => {
     fx,
     sysGainDb: (audio && typeof audio.sysGainDb === 'number') ? audio.sysGainDb : 0,
     micGainDb: (audio && typeof audio.micGainDb === 'number') ? audio.micGainDb : 0,
+    sysDelayMs: (audio && audio.sysDelayMs) || 0,
   });
   // Facecam overlay (if any) forces the CPU-composite path (no overlay_qsv): ddagrab→hwdownload
   // →overlay→hwupload(qsv). Otherwise the zero-copy hwmap path.
