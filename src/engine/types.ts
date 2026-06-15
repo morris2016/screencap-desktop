@@ -126,6 +126,16 @@ export interface NativeAudioOpts {
    * window's PID (wasaploop) + mic. Set both to scope video AND audio to one app. */
   windowHwnd?: number;
   windowPid?: number;
+  /** Facecam (webcam) PiP overlay composited natively into the video, or null. */
+  cam?: CamOverlay | null;
+}
+
+/** Facecam overlay config. device = dshow video name; pos = corner; sizePct of canvas width. */
+export interface CamOverlay {
+  device: string;
+  pos: 'tl' | 'tr' | 'bl' | 'br';
+  sizePct: number;
+  mirror: boolean;
 }
 
 export interface AudioApp {
@@ -176,6 +186,7 @@ declare global {
       openExternal(url: string): Promise<void>;
       listAudioApps(): Promise<AudioApp[]>;
       listWindows(): Promise<CaptureWindow[]>;
+      listCameras(): Promise<string[]>;
       setSysGains(gainsDb: number[]): void;
       nativeRecordStart(micDevice: string | null, fx: unknown, audio: NativeAudioOpts): Promise<{ ok: boolean; error?: string }>;
       nativeRecordStop(): Promise<string | null>;

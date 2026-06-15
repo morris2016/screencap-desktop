@@ -7,7 +7,7 @@ import { Recorder, Streamer } from './engine/recorder';
 import { MicSource, ScreenSource, WebcamSource } from './engine/sources';
 import { DEFAULT_FX, presetBands, VoiceChain, type VoiceFx } from './engine/voicechain';
 import { YouTubePanel } from './components/YouTubePanel';
-import type { AudioApp, CaptureSourceInfo, CaptureWindow, LinkInfo, Scene, SceneItem, Source } from './engine/types';
+import type { AudioApp, CamOverlay, CaptureSourceInfo, CaptureWindow, LinkInfo, Scene, SceneItem, Source } from './engine/types';
 
 interface LibItem {
   name: string;
@@ -60,6 +60,13 @@ export function App() {
   const [windowList, setWindowList] = useState<CaptureWindow[]>([]);
   const [shareWindow, setShareWindow] = useState<CaptureWindow | null>(null);
   const refreshWindows = () => window.screencap.listWindows().then(setWindowList);
+  // 🎥 Facecam (webcam) PiP overlay — composited natively into the stream/recording.
+  const [camList, setCamList] = useState<string[]>([]);
+  const [cam, setCamState] = useState<CamOverlay | null>(JSON.parse(localStorage.getItem('cam') ?? 'null'));
+  const refreshCameras = () => window.screencap.listCameras().then(setCamList);
+  const setCam = (c: CamOverlay | null) => { setCamState(c); localStorage.setItem('cam', JSON.stringify(c)); };
+  const patchCam = (p: Partial<CamOverlay>) =>
+    setCam({ device: '', pos: 'br', sizePct: 0.25, mirror: false, ...(cam ?? {}), ...p });
   function toggleInternalApp(name: string) {
     setInternalAppNames((cur) => {
       const next = cur.includes(name) ? cur.filter((n) => n !== name) : [...cur, name];
@@ -359,7 +366,7 @@ export function App() {
     // Native-first (throttle-proof): direct mode → ffmpeg records screen + mic + system
     // audio (all native) itself. Scene mode keeps the compositor/MediaRecorder path.
     const nat = await nativeAudioPlan();
-    if (directMode && (nat.micDevice || nat.audio.system || nat.audio.windowHwnd)) {
+    if (directMode && (nat.micDevice || nat.audio.system || nat.audio.windowHwnd || nat.audio.cam)) {
       const res = await window.screencap.nativeRecordStart(nat.micDevice, nat.fx, nat.audio);
       if (res.ok) {
         nativeRecStart.current = Date.now();
@@ -414,6 +421,7 @@ export function App() {
         system, systemPids, systemGains, sysGainDb: masterSys, micGainDb,
         windowHwnd: win?.hwnd, windowPid: win?.pid,
         windowGainDb: win ? appGainDb(win.name) : 0,
+        cam: cam && cam.device ? cam : null,
       },
     };
   }
@@ -434,7 +442,7 @@ export function App() {
     // WASAPI loopback, wasaploop.exe) and mixes them in-filter. No Chromium in the live
     // path → immune to renderer/occlusion throttling (the switch-away breaking).
     const nat = await nativeAudioPlan();
-    streamIsNative.current = directMode && (!!nat.micDevice || nat.audio.system || !!nat.audio.windowHwnd);
+    streamIsNative.current = directMode && (!!nat.micDevice || nat.audio.system || !!nat.audio.windowHwnd || !!nat.audio.cam);
     const err = await streamer.start(
       compositor.captureStream(30), mixer.stream, url, key, 6000, directMode,
       nat.micDevice, nat.fx, nat.audio,
@@ -768,6 +776,32 @@ export function App() {
           <input type="range" min="-30" max="12" step="1" value={micGainDb}
             onChange={(e) => { const v = Number(e.target.value); setMicGainDb(v); localStorage.setItem('micGainDb', String(v)); }} />
           <div style={{ fontSize: 11, color: 'var(--dim)', textAlign: 'right' }}>{micGainDb > 0 ? '+' : ''}{micGainDb} dB</div>
+        </div>
+        <div className="strip" style={{ width: 188 }}>
+          <div className="name">🎥 Facecam</div>
+          <select className="add" style={{ width: '100%', marginBottom: 6, fontSize: 11, padding: 4 }}
+            value={cam?.device ?? ''} onMouseDown={refreshCameras}
+            onChange={(e) => setCam(e.target.value ? { device: e.target.value, pos: cam?.pos ?? 'br', sizePct: cam?.sizePct ?? 0.25, mirror: cam?.mirror ?? false } : null)}>
+            <option value="">Off</option>
+            {camList.map((c) => <option key={c} value={c}>{c.length > 22 ? c.slice(0, 22) + '…' : c}</option>)}
+          </select>
+          {cam?.device && (
+            <>
+              <div style={{ display: 'flex', gap: 3, marginBottom: 5 }}>
+                {(['tl', 'tr', 'bl', 'br'] as const).map((p) => (
+                  <button key={p} className="add" title={p}
+                    style={{ marginBottom: 0, padding: '2px 0', flex: 1, fontSize: 13, outline: cam.pos === p ? '2px solid var(--accent2)' : 'none' }}
+                    onClick={() => patchCam({ pos: p })}>{{ tl: '◰', tr: '◳', bl: '◱', br: '◲' }[p]}</button>
+                ))}
+              </div>
+              <input type="range" min="12" max="45" step="1" value={Math.round((cam.sizePct ?? 0.25) * 100)}
+                onChange={(e) => patchCam({ sizePct: Number(e.target.value) / 100 })} style={{ width: '100%' }} />
+              <div style={{ fontSize: 11, color: 'var(--dim)', display: 'flex', justifyContent: 'space-between' }}>
+                <span>size {Math.round((cam.sizePct ?? 0.25) * 100)}%</span>
+                <a style={{ cursor: 'pointer', color: cam.mirror ? 'var(--accent2)' : 'var(--dim)' }} onClick={() => patchCam({ mirror: !cam.mirror })}>{cam.mirror ? '🔁 mirrored' : 'mirror'}</a>
+              </div>
+            </>
+          )}
         </div>
         {sources.filter((s) => s.audioNode).map((s) => (
           <div className="strip" key={s.id}>

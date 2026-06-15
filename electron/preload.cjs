@@ -25,6 +25,7 @@ contextBridge.exposeInMainWorld('screencap', {
   openExternal: (url) => ipcRenderer.invoke('open-external', url),
   listAudioApps: () => ipcRenderer.invoke('list-audio-apps'),
   listWindows: () => ipcRenderer.invoke('list-windows'),
+  listCameras: () => ipcRenderer.invoke('list-cameras'),
   setSysGains: (gainsDb) => ipcRenderer.send('set-sys-gains', gainsDb),
   nativeRecordStart: (micDevice, fx, audio) => ipcRenderer.invoke('native-record-start', micDevice, fx, audio),
   nativeRecordStop: () => ipcRenderer.invoke('native-record-stop'),

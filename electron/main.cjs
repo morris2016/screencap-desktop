@@ -208,6 +208,7 @@ const stream = {
   winPipe: null,        // named-pipe server carrying the window app's audio
   winEnc: 'nvenc',      // window-stream encoder ladder: nvenc → qsv → x264
   gainRef: null,        // live per-app volume ref the Node mixer reads each block
+  cam: null,            // facecam overlay { device, pos, sizePct, mirror } or null
   fx: null,             // VoiceFx settings from the renderer → ffmpeg filter chain
   qsvBroken: false,     // QuickSync failed this session — fall back to libx264
   spawnMs: 0,           // watchdog startup-grace anchor
@@ -372,18 +373,36 @@ function spawnWindowVideo(hwnd, maxH, cb) {
 // Build the ffmpeg input/filter/map for WINDOW-capture mode: video = wgccap rawvideo on stdin
 // (input 0), mic = dshow (input 1), per-app system audio = f32le named pipe (input 2). Mic peak
 // control stays on the mic channel; system app audio rides through at unity (no cross-duck).
-function windowFfmpegAV({ W, H, micDevice, fx, sysPipePath, encoder }) {
+// Facecam (webcam) PiP overlay chain. cam = { device, pos:'tl|tr|bl|br', sizePct, mirror }.
+// Sizes the camera relative to the 1080p canvas and pins it to a corner with a margin.
+function camChain(baseLabel, outLabel, cam, camIdx) {
+  const pct = Math.min(0.5, Math.max(0.1, cam.sizePct || 0.25));
+  const cw = Math.round(1920 * pct / 2) * 2;
+  const m = 28;
+  const xy = { tl: `${m}:${m}`, tr: `W-w-${m}:${m}`, bl: `${m}:H-h-${m}`, br: `W-w-${m}:H-h-${m}` }[cam.pos || 'br'];
+  const flip = cam.mirror ? 'hflip,' : '';
+  // 'facecam@cam' / 'facecam@ov' named so a zmq layer can move/toggle them live later.
+  return `[${camIdx}:v]${flip}scale=${cw}:-2[fc${camIdx}];[${baseLabel}][fc${camIdx}]overlay@ov=${xy}[${outLabel}]`;
+}
+
+function windowFfmpegAV({ W, H, micDevice, fx, sysPipePath, encoder, cam }) {
   const inputs = ['-f', 'rawvideo', '-pixel_format', 'bgra', '-video_size', `${W}x${H}`, '-framerate', '30', '-thread_queue_size', '64', '-i', 'pipe:0'];
-  let mi = -1, si = -1, n = 1;
+  let mi = -1, si = -1, ci = -1, n = 1;
   if (micDevice) { inputs.push('-f', 'dshow', '-audio_buffer_size', '80', '-thread_queue_size', '4096', '-rtbufsize', '64M', '-i', `audio=${micDevice}`); mi = n++; }
   if (sysPipePath) { inputs.push('-f', 'f32le', '-ar', '48000', '-ac', '2', '-thread_queue_size', '4096', '-i', sysPipePath); si = n++; }
+  if (cam && cam.device) { inputs.push('-f', 'dshow', '-rtbufsize', '128M', '-i', `video=${cam.device}`); ci = n++; }
   // Encoder picks the upload + device. NVENC offloads scale+encode to the NVIDIA GPU so the
   // Intel iGPU is left free for wgccap capture (the window path otherwise overloads one iGPU
   // with capture+downscale+readback+encode and falls below realtime under app load).
-  let hw, vseg;
-  if (encoder === 'nvenc') { hw = ['-init_hw_device', 'cuda=cu', '-filter_hw_device', 'cu']; vseg = `[0:v]scale=-2:'min(1080,ih)',format=nv12,hwupload_cuda[v]`; }
-  else if (encoder === 'qsv') { hw = ['-init_hw_device', 'qsv=qs', '-filter_hw_device', 'qs']; vseg = `[0:v]scale=-2:'min(1080,ih)',format=nv12,hwupload[v]`; }
-  else { hw = []; vseg = `[0:v]scale=-2:'min(1080,ih)',format=yuv420p[v]`; }
+  const encFmt = encoder === 'nvenc' ? 'format=nv12,hwupload_cuda' : encoder === 'qsv' ? 'format=nv12,hwupload' : 'format=yuv420p';
+  const hw = encoder === 'nvenc' ? ['-init_hw_device', 'cuda=cu', '-filter_hw_device', 'cu']
+    : encoder === 'qsv' ? ['-init_hw_device', 'qsv=qs', '-filter_hw_device', 'qs'] : [];
+  let vseg;
+  if (ci >= 0) {
+    vseg = `[0:v]scale=-2:'min(1080,ih)'[scr];${camChain('scr', 'comp', cam, ci)};[comp]${encFmt}[v]`;
+  } else {
+    vseg = `[0:v]scale=-2:'min(1080,ih)',${encFmt}[v]`;
+  }
   const aseg = [];
   let amap = null;
   if (mi >= 0 && si >= 0) {
@@ -485,13 +504,25 @@ function spawnStream() {
     useSysPipe = na.usePipe;
     // Downscale to 1080p (keep aspect): a 1440p/4K desktop captured natively makes YouTube
     // demand ~23500kbps; at the uplink-feasible ~6000kbps that looks blocky. Sharp 1080p
-    // is the right target. scale_qsv stays on-GPU (zero-copy).
-    const vfilter = useQsv
-      ? 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv,scale_qsv=w=-1:h=1080[v]'
-      : `ddagrab=framerate=30,hwdownload,format=bgra,scale='min(1920,iw)':-2[v]`;
+    // is the right target. scale_qsv stays on-GPU (zero-copy) UNLESS a facecam overlay is
+    // present — then we must leave the GPU (no overlay_qsv): ddagrab→hwdownload→CPU composite
+    // →hwupload(qsv) (validated realtime). The mic/system audio inputs come first; the camera
+    // dshow input is appended after them.
     const hw = useQsv ? ['-init_hw_device', 'd3d11va=dx', '-init_hw_device', 'qsv=qs@dx', '-filter_hw_device', 'dx'] : [];
+    const camInputs = [];
+    let vfilter;
+    if (stream.cam && stream.cam.device) {
+      const ci = na.inputs.filter((a) => a === '-i').length; // camera = first input after audio
+      camInputs.push('-f', 'dshow', '-rtbufsize', '128M', '-i', `video=${stream.cam.device}`);
+      const enc = useQsv ? `format=nv12,hwupload=derive_device=qsv` : `format=yuv420p`;
+      vfilter = `ddagrab=framerate=30,hwdownload,format=bgra,scale=-2:1080[scr];${camChain('scr', 'comp', stream.cam, ci)};[comp]${enc}[v]`;
+    } else {
+      vfilter = useQsv
+        ? 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv,scale_qsv=w=-1:h=1080[v]'
+        : `ddagrab=framerate=30,hwdownload,format=bgra,scale='min(1920,iw)':-2[v]`;
+    }
     const fc = [vfilter, ...na.filterSegs].join(';');
-    input = [...hw, ...na.inputs, '-filter_complex', fc, '-map', '[v]'];
+    input = [...hw, ...na.inputs, ...camInputs, '-filter_complex', fc, '-map', '[v]'];
     if (na.mapLabel) input.push('-map', na.mapLabel);
     audioOut = na.mapLabel ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000'] : [];
   } else {
@@ -549,7 +580,7 @@ function spawnStreamWindow(ff, logPath) {
       return;
     }
     const pipe = stream.windowPid > 0 ? serveSysAudioPipe([stream.windowPid], stream.gainRef) : null;
-    const av = windowFfmpegAV({ W, H, micDevice: stream.micDevice, fx: stream.fx, sysPipePath: pipe && pipe.pipePath, encoder: enc });
+    const av = windowFfmpegAV({ W, H, micDevice: stream.micDevice, fx: stream.fx, sysPipePath: pipe && pipe.pipePath, encoder: enc, cam: stream.cam });
     const venc = windowVenc(enc, stream.bitrateK, true);
     const p = spawn(ff, [...av.hw, ...av.inputs, '-filter_complex', av.fc, ...av.maps, ...venc,
       ...(av.hasAudio ? ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000'] : []),
@@ -722,6 +753,7 @@ ipcMain.handle('stream-start', (e, url, key, bitrateK, direct, micDevice, fx, au
   stream.windowGainDb = (audio && typeof audio.windowGainDb === 'number') ? audio.windowGainDb : 0;
   // Live per-app volume ref (read by the mixer every block; updated via 'set-sys-gains').
   stream.gainRef = makeGainRef(stream.windowHwnd ? [stream.windowGainDb] : stream.systemGains);
+  stream.cam = (audio && audio.cam && audio.cam.device) ? audio.cam : null; // facecam overlay
   stream.winEnc = 'nvenc'; // window encoder ladder start: NVIDIA NVENC (off the capture iGPU)
   stream.qsvBroken = false; // re-probe QuickSync each go-live
   stream.wanted = true;
@@ -794,7 +826,7 @@ ipcMain.handle('native-record-start', async (e, micDevice, fx, audio) => {
           if (err || !wg) { try { wg && wg.kill(); } catch {} if (!resolved) { resolved = true; resolve({ ok: false, error: 'window capture unavailable' }); } return; }
           const pipe = windowPid > 0 ? serveSysAudioPipe([windowPid], nrec.gainRef) : null;
           const recEnc = useQsv ? 'qsv' : 'x264';
-          const av = windowFfmpegAV({ W, H, micDevice, fx, sysPipePath: pipe && pipe.pipePath, encoder: recEnc });
+          const av = windowFfmpegAV({ W, H, micDevice, fx, sysPipePath: pipe && pipe.pipePath, encoder: recEnc, cam: (audio && audio.cam) || null });
           const venc = windowVenc(recEnc, 8000, false);
           const p = spawn(ff, [...av.hw, ...av.inputs, '-filter_complex', av.fc, ...av.maps,
             ...venc, ...(av.hasAudio ? ['-c:a', 'aac', '-b:a', '192k', '-ar', '48000'] : []),
@@ -830,10 +862,22 @@ ipcMain.handle('native-record-start', async (e, micDevice, fx, audio) => {
     sysGainDb: (audio && typeof audio.sysGainDb === 'number') ? audio.sysGainDb : 0,
     micGainDb: (audio && typeof audio.micGainDb === 'number') ? audio.micGainDb : 0,
   });
-  const fc = ['ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]', ...na.filterSegs].join(';');
+  // Facecam overlay (if any) forces the CPU-composite path (no overlay_qsv): ddagrab→hwdownload
+  // →overlay→hwupload(qsv). Otherwise the zero-copy hwmap path.
+  const recCam = (audio && audio.cam && audio.cam.device) ? audio.cam : null;
+  const recCamInputs = [];
+  let recVf;
+  if (recCam) {
+    const ci = na.inputs.filter((a) => a === '-i').length;
+    recCamInputs.push('-f', 'dshow', '-rtbufsize', '128M', '-i', `video=${recCam.device}`);
+    recVf = `ddagrab=framerate=30,hwdownload,format=bgra,scale=-2:1080[scr];${camChain('scr', 'comp', recCam, ci)};[comp]format=nv12,hwupload=derive_device=qsv[v]`;
+  } else {
+    recVf = 'ddagrab=framerate=30,hwmap=derive_device=qsv:extra_hw_frames=16,format=qsv[v]';
+  }
+  const fc = [recVf, ...na.filterSegs].join(';');
   const p = spawn(ff, [
     '-init_hw_device', 'd3d11va=dx', '-init_hw_device', 'qsv=qs@dx', '-filter_hw_device', 'dx',
-    ...na.inputs,
+    ...na.inputs, ...recCamInputs,
     '-filter_complex', fc,
     '-map', '[v]', ...(na.mapLabel ? ['-map', na.mapLabel] : []),
     '-c:v', 'h264_qsv', '-preset', 'fast', '-b:v', '8000k', '-maxrate', '8000k',
@@ -989,6 +1033,21 @@ ipcMain.handle('list-windows', () => {
           // Drop our own windows; keep real app windows with a valid HWND.
           resolve(arr.filter((w) => w.hwnd && !/ScreenCap Studio|electron/i.test(w.name || '')));
         } catch { resolve([]); }
+      });
+  });
+});
+// DirectShow video devices (webcams) for the facecam overlay — ffmpeg's own enumeration so the
+// names match exactly what `-f dshow -i video="..."` expects.
+ipcMain.handle('list-cameras', () => {
+  return new Promise((resolve) => {
+    const ff = ffmpegPath();
+    if (!ff) return resolve([]);
+    require('child_process').execFile(ff, ['-hide_banner', '-f', 'dshow', '-list_devices', 'true', '-i', 'dummy'],
+      { windowsHide: true, timeout: 5000 }, (_err, stdout, stderr) => {
+        const out = `${stderr || ''}${stdout || ''}`;
+        const names = []; const re = /"([^"]+)"\s*\(video\)/g; let m;
+        while ((m = re.exec(out))) if (!names.includes(m[1])) names.push(m[1]);
+        resolve(names);
       });
   });
 });
