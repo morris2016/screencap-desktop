@@ -78,8 +78,9 @@ export function App() {
   const [sysGainDb, setSysGainDb] = useState(Number(localStorage.getItem('sysGainDb') ?? '0'));
   const [micGainDb, setMicGainDb] = useState(Number(localStorage.getItem('micGainDb') ?? '0'));
   // A/V sync: WASAPI loopback delivers already-played audio, so system sound trails the live
-  // picture. Negative = advance system audio (fixes the lag). Default -100ms; operator fine-tunes.
-  const [sysDelayMs, setSysDelayMs] = useState(Number(localStorage.getItem('sysDelayMs') ?? '-100'));
+  // picture. Negative = advance system audio (fixes the lag). Default -60ms: MEASURED through the
+  // real ddagrab+wasaploop pipeline (flash-vs-beep capture of a Firefox sync test = ~58ms lag).
+  const [sysDelayMs, setSysDelayMs] = useState(Number(localStorage.getItem('sysDelayMs') ?? '-60'));
   // Per-app volume + mute (keyed by app/process name) — operator rides or mutes each app's sound
   // (e.g. duck Discord while speaking); viewers hear exactly the controlled level. -120 = muted.
   const [appGains, setAppGains] = useState<Record<string, number>>(JSON.parse(localStorage.getItem('appGains') ?? '{}'));
