@@ -644,6 +644,21 @@ export function App() {
                 </div>
               </div>
             )}
+            {cam?.device && (
+              <div
+                style={{
+                  position: 'absolute',
+                  width: `${(cam.sizePct ?? 0.25) * 100}%`,
+                  aspectRatio: '16 / 9',
+                  border: '2px dashed var(--accent2)',
+                  background: 'rgba(108,99,255,0.14)',
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 12, color: 'var(--accent2)', pointerEvents: 'none', borderRadius: 4,
+                  ...((cam.pos ?? 'br').includes('t') ? { top: '2.6%' } : { bottom: '2.6%' }),
+                  ...((cam.pos ?? 'br').includes('l') ? { left: '1.5%' } : { right: '1.5%' }),
+                }}
+              >📷 facecam</div>
+            )}
           </div>
           <div className="controls">
             <button className={`btn rec ${recState !== 'inactive' ? 'on' : ''}`} onClick={toggleRecord}>
