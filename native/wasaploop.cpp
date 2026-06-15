@@ -142,10 +142,14 @@ int main(int argc, char** argv) {
 
     if (FAILED(pClient->Start())) return 8;
 
-    // Measure the STEADY-STATE age of captured audio from WASAPI's per-packet QPC timestamp (skip
-    // the startup backlog; the freshest packets = the true loopback latency to compensate for sync).
+    // SELF-ALIGNING START: the loopback buffer already holds audio that was rendered BEFORE we
+    // started reading (a backlog of tens-to-hundreds of ms). If we emit it, it fills the front of
+    // the stream and pushes ALL later audio late by that much — the "audio lags video" offset, and
+    // it varies per run. WASAPI tags each packet with the QPC time it was rendered, so we DISCARD
+    // stale packets at startup and only begin emitting once we've caught up to live audio (age small).
+    // This puts the sync correction in the audio engine itself — no downstream offset/calibration.
     LARGE_INTEGER qfreq; QueryPerformanceFrequency(&qfreq);
-    int latSeen = 0; double latMin = 1e9; bool latDone = false;
+    bool synced = false; int discarded = 0;
 
     static BYTE zeros[19200];
     for (;;) {
@@ -155,13 +159,21 @@ int main(int argc, char** argv) {
         while (packetLen != 0) {
             BYTE* data = NULL; UINT32 frames = 0; DWORD flags = 0; UINT64 devpos = 0, qpcpos = 0;
             if (FAILED(cap->GetBuffer(&data, &frames, &flags, &devpos, &qpcpos))) { packetLen = 0; break; }
-            if (!latDone && qpcpos > 0) {
-                LARGE_INTEGER now; QueryPerformanceCounter(&now);
-                UINT64 now100 = (UINT64)((double)now.QuadPart * 10000000.0 / (double)qfreq.QuadPart);
-                double lat = (double)((long long)(now100 - qpcpos)) / 10000.0; // ms
-                latSeen++;
-                if (latSeen > 50 && lat > 0 && lat < 1000 && lat < latMin) latMin = lat; // skip startup, take floor
-                if (latSeen >= 250) { fprintf(stderr, "WASAPI_LATENCY_MS=%.1f\n", latMin); fflush(stderr); latDone = true; }
+            if (!synced) {
+                double age = 0;
+                if (qpcpos > 0) {
+                    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+                    UINT64 now100 = (UINT64)((double)now.QuadPart * 10000000.0 / (double)qfreq.QuadPart);
+                    age = (double)((long long)(now100 - qpcpos)) / 10000.0; // ms old
+                }
+                if (qpcpos > 0 && age > 40.0 && discarded < 400) { // stale backlog → drop & keep draining
+                    discarded++;
+                    cap->ReleaseBuffer(frames);
+                    if (FAILED(cap->GetNextPacketSize(&packetLen))) packetLen = 0;
+                    continue;
+                }
+                synced = true; // caught up to live audio (or hit the safety cap); emit from here
+                fprintf(stderr, "WASAPI_SYNCED age=%.1fms\n", age); fflush(stderr);
             }
             UINT32 bytes = frames * frameBytes;
             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
