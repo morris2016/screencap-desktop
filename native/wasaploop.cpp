@@ -135,7 +135,17 @@ int main(int argc, char** argv) {
     if (sleepMs < 2) sleepMs = 2;
     const UINT32 frameBytes = pwfx->nChannels * pwfx->wBitsPerSample / 8;
 
+    // Report the engine's own stream latency (the unavoidable loopback buffer delay).
+    REFERENCE_TIME streamLat = 0; pClient->GetStreamLatency(&streamLat);
+    fprintf(stderr, "WASAPI_STREAM_LATENCY_MS=%.1f\n", (double)streamLat / 10000.0);
+    fflush(stderr);
+
     if (FAILED(pClient->Start())) return 8;
+
+    // Measure the STEADY-STATE age of captured audio from WASAPI's per-packet QPC timestamp (skip
+    // the startup backlog; the freshest packets = the true loopback latency to compensate for sync).
+    LARGE_INTEGER qfreq; QueryPerformanceFrequency(&qfreq);
+    int latSeen = 0; double latMin = 1e9; bool latDone = false;
 
     static BYTE zeros[19200];
     for (;;) {
@@ -143,8 +153,16 @@ int main(int argc, char** argv) {
         UINT32 packetLen = 0;
         if (FAILED(cap->GetNextPacketSize(&packetLen))) break;
         while (packetLen != 0) {
-            BYTE* data = NULL; UINT32 frames = 0; DWORD flags = 0;
-            if (FAILED(cap->GetBuffer(&data, &frames, &flags, NULL, NULL))) { packetLen = 0; break; }
+            BYTE* data = NULL; UINT32 frames = 0; DWORD flags = 0; UINT64 devpos = 0, qpcpos = 0;
+            if (FAILED(cap->GetBuffer(&data, &frames, &flags, &devpos, &qpcpos))) { packetLen = 0; break; }
+            if (!latDone && qpcpos > 0) {
+                LARGE_INTEGER now; QueryPerformanceCounter(&now);
+                UINT64 now100 = (UINT64)((double)now.QuadPart * 10000000.0 / (double)qfreq.QuadPart);
+                double lat = (double)((long long)(now100 - qpcpos)) / 10000.0; // ms
+                latSeen++;
+                if (latSeen > 50 && lat > 0 && lat < 1000 && lat < latMin) latMin = lat; // skip startup, take floor
+                if (latSeen >= 250) { fprintf(stderr, "WASAPI_LATENCY_MS=%.1f\n", latMin); fflush(stderr); latDone = true; }
+            }
             UINT32 bytes = frames * frameBytes;
             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
                 UINT32 rem = bytes;
